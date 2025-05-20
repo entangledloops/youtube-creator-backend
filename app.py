@@ -256,8 +256,14 @@ async def analyze_creator(request: CreatorAnalysisRequest):
         creator_url = str(request.creator_url).strip()
         logger.info(f"Analyzing creator URL: {creator_url}")
         
-        # Get channel data (videos and transcripts)
-        channel_data = youtube_analyzer.analyze_channel(creator_url, video_limit=request.video_limit)
+        # Get channel data (videos and transcripts) asynchronously
+        # Only use concurrent processing for OpenAI
+        use_concurrent = request.llm_provider == "openai"
+        channel_data = await youtube_analyzer.analyze_channel_async(
+            creator_url, 
+            video_limit=request.video_limit,
+            use_concurrent=use_concurrent
+        )
         
         if not channel_data:
             raise HTTPException(status_code=404, detail="Could not extract channel data")

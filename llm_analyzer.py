@@ -453,11 +453,13 @@ INSTRUCTIONS:
             }
             
             if self.provider == "openai":
+                logger.info("Using CONCURRENT processing for OpenAI analysis")
                 # For OpenAI, process videos in parallel
                 tasks = []
                 for video in channel_data.get('videos', []):
                     if not video.get('transcript'):
                         continue
+                    logger.debug(f"Creating OpenAI analysis task for video: {video['id']} - {video['title']}")
                     tasks.append(self.analyze_transcript_async(
                         transcript_text=video['transcript']['full_text'],
                         video_title=video.get('title', 'Unknown Title'),
@@ -465,14 +467,16 @@ INSTRUCTIONS:
                     ))
                 
                 # Wait for all analyses to complete
+                logger.info(f"Waiting for {len(tasks)} OpenAI analysis tasks to complete")
                 analyses = await asyncio.gather(*tasks, return_exceptions=True)
                 
                 # Process results
                 for video, analysis in zip([v for v in channel_data.get('videos', []) if v.get('transcript')], analyses):
                     if isinstance(analysis, Exception):
-                        logger.error(f"Error analyzing video {video.get('id')}: {str(analysis)}")
+                        logger.error(f"✗ Error analyzing video {video.get('id')}: {str(analysis)}")
                         continue
                         
+                    logger.info(f"✓ OpenAI analysis completed for video: {video['id']} - {video['title']}")
                     results["video_analyses"].append({
                         "video_id": video.get('id', 'unknown'),
                         "video_title": video.get('title', 'Unknown Title'),
@@ -480,11 +484,13 @@ INSTRUCTIONS:
                         "analysis": analysis
                     })
             else:
+                logger.info("Using SEQUENTIAL processing for local LLM analysis")
                 # For local LLM, process videos sequentially for easier debugging
                 for video in channel_data.get('videos', []):
                     if not video.get('transcript'):
                         continue
                         
+                    logger.debug(f"Analyzing video with local LLM: {video['id']} - {video['title']}")
                     # Analyze the video
                     analysis = self.analyze_transcript(
                         transcript_text=video['transcript']['full_text'],
@@ -492,6 +498,7 @@ INSTRUCTIONS:
                         video_id=video.get('id', 'unknown')
                     )
                     
+                    logger.info(f"✓ Local LLM analysis completed for video: {video['id']} - {video['title']}")
                     # Add to results
                     results["video_analyses"].append({
                         "video_id": video.get('id', 'unknown'),

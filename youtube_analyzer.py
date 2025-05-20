@@ -3,10 +3,13 @@ YouTube data collector for compliance analysis
 """
 import re
 import requests
+import asyncio
+import aiohttp
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse, parse_qs
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
 import logging
+from typing import Dict, List, Any, Optional
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -14,6 +17,7 @@ logger = logging.getLogger(__name__)
 class YouTubeAnalyzer:
     def __init__(self, youtube_api_key=None):
         self.youtube_api_key = youtube_api_key
+        self.semaphore = asyncio.Semaphore(5)  # Limit concurrent transcript fetches
         
     def extract_channel_info_from_url(self, url):
         """Extract channel ID, name, and handle from a YouTube URL"""
@@ -251,31 +255,45 @@ class YouTubeAnalyzer:
             
         return videos
     
-    def get_transcript(self, video_id):
-        """Get transcript for a YouTube video"""
-        try:
-            # Directly get transcript data - simpler approach to avoid the error
-            transcript_data = YouTubeTranscriptApi.get_transcript(video_id, languages=['en', 'en-US', 'en-GB'])
-            
-            if not transcript_data:
+    async def get_transcript_async(self, video_id: str) -> Optional[Dict[str, Any]]:
+        """Get transcript for a YouTube video asynchronously with rate limiting"""
+        async with self.semaphore:  # Rate limiting
+            try:
+                # Use aiohttp for async HTTP requests
+                async with aiohttp.ClientSession() as session:
+                    # Get transcript data
+                    transcript_data = await asyncio.to_thread(
+                        YouTubeTranscriptApi.get_transcript,
+                        video_id,
+                        languages=['en', 'en-US', 'en-GB']
+                    )
+                    
+                    if not transcript_data:
+                        return None
+                        
+                    # Create full text from transcript segments
+                    full_text = ' '.join([entry.get('text', '') for entry in transcript_data])
+                    
+                    return {
+                        'full_text': full_text,
+                        'segments': transcript_data
+                    }
+            except (TranscriptsDisabled, NoTranscriptFound) as e:
+                logger.warning(f"No transcript available for video {video_id}: {str(e)}")
                 return None
-                
-            # Create full text from transcript segments
-            full_text = ' '.join([entry.get('text', '') for entry in transcript_data])
-            
-            return {
-                'full_text': full_text,
-                'segments': transcript_data
-            }
-        except (TranscriptsDisabled, NoTranscriptFound) as e:
-            logger.warning(f"No transcript available for video {video_id}: {str(e)}")
-            return None
-        except Exception as e:
-            logger.error(f"Error fetching transcript for video {video_id}: {str(e)}")
-            return None
-            
-    def analyze_channel(self, channel_url, video_limit=10):
-        """Analyze a channel by collecting transcripts from its videos"""
+            except Exception as e:
+                logger.error(f"Error fetching transcript for video {video_id}: {str(e)}")
+                return None
+
+    async def analyze_channel_async(self, channel_url: str, video_limit: int = 10, use_concurrent: bool = False) -> Optional[Dict[str, Any]]:
+        """
+        Analyze a channel by collecting transcripts from its videos asynchronously
+        
+        Args:
+            channel_url: URL of the YouTube channel
+            video_limit: Maximum number of videos to analyze
+            use_concurrent: Whether to use concurrent processing (for OpenAI)
+        """
         channel_id, channel_name, channel_handle = self.extract_channel_info_from_url(channel_url)
         if not channel_id:
             logger.error(f"Could not extract channel ID from {channel_url}")
@@ -291,11 +309,47 @@ class YouTubeAnalyzer:
             'videos': []
         }
         
-        for video in videos:
-            transcript = self.get_transcript(video['id'])
-            if transcript:
-                video['transcript'] = transcript
-                channel_data['videos'].append(video)
+        if use_concurrent:
+            logger.info("Using CONCURRENT processing for transcript fetching")
+            # Create tasks for concurrent transcript fetching
+            tasks = []
+            for video in videos:
+                logger.debug(f"Creating task for video: {video['id']} - {video['title']}")
+                task = self.get_transcript_async(video['id'])
+                tasks.append((video, task))
+            
+            # Wait for all transcript fetches to complete
+            for video, task in tasks:
+                logger.debug(f"Waiting for transcript: {video['id']} - {video['title']}")
+                transcript = await task
+                if transcript:
+                    logger.info(f"✓ Successfully fetched transcript for video: {video['id']} - {video['title']}")
+                    video['transcript'] = transcript
+                    channel_data['videos'].append(video)
+                else:
+                    logger.warning(f"✗ Failed to fetch transcript for video: {video['id']} - {video['title']}")
+        else:
+            logger.info("Using SEQUENTIAL processing for transcript fetching")
+            # Sequential processing for local LLM
+            for video in videos:
+                logger.debug(f"Fetching transcript for video: {video['id']} - {video['title']}")
+                transcript = await self.get_transcript_async(video['id'])
+                if transcript:
+                    logger.info(f"✓ Successfully fetched transcript for video: {video['id']} - {video['title']}")
+                    video['transcript'] = transcript
+                    channel_data['videos'].append(video)
+                else:
+                    logger.warning(f"✗ Failed to fetch transcript for video: {video['id']} - {video['title']}")
                 
         logger.info(f"Successfully retrieved transcripts for {len(channel_data['videos'])} videos")
-        return channel_data 
+        return channel_data
+
+    # Keep the synchronous version for backward compatibility
+    def analyze_channel(self, channel_url: str, video_limit: int = 10, use_concurrent: bool = False) -> Optional[Dict[str, Any]]:
+        """Synchronous version of analyze_channel for backward compatibility"""
+        return asyncio.run(self.analyze_channel_async(channel_url, video_limit, use_concurrent))
+
+    # Keep the synchronous version for backward compatibility
+    def get_transcript(self, video_id: str) -> Optional[Dict[str, Any]]:
+        """Synchronous version of get_transcript for backward compatibility"""
+        return asyncio.run(self.get_transcript_async(video_id)) 
