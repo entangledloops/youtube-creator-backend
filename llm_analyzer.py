@@ -4,10 +4,12 @@ LLM Analyzer module for processing YouTube content against compliance categories
 import os
 import json
 import re
+import aiohttp
 import requests
 import pandas as pd
 import logging
 from typing import List, Dict, Any, Optional
+import asyncio
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -31,6 +33,8 @@ class LLMAnalyzer:
             self.api_key = os.getenv("OPENAI_API_KEY")
             if not self.api_key:
                 raise ValueError("OpenAI API key not found in environment variables")
+            # Add debug logging for API key
+            logger.info(f"OpenAI API key loaded: {self.api_key[:4]}...{self.api_key[-4:] if len(self.api_key) > 8 else ''}")
         else:
             raise ValueError(f"Unsupported LLM provider: {provider}")
             
@@ -131,7 +135,7 @@ INSTRUCTIONS:
     
     def analyze_transcript(self, transcript_text: str, video_title: str, video_id: str) -> Dict[str, Any]:
         """
-        Analyze transcript content against compliance categories
+        Analyze transcript content against compliance categories (synchronous version)
         
         Args:
             transcript_text: Full text of video transcript
@@ -152,8 +156,31 @@ INSTRUCTIONS:
             logger.error(f"Error analyzing transcript: {str(e)}")
             return {"error": str(e)}
     
+    async def analyze_transcript_async(self, transcript_text: str, video_title: str, video_id: str) -> Dict[str, Any]:
+        """
+        Analyze transcript content against compliance categories (asynchronous version)
+        
+        Args:
+            transcript_text: Full text of video transcript
+            video_title: Title of the video
+            video_id: YouTube video ID
+            
+        Returns:
+            Dictionary with analysis results
+        """
+        prompt = self._format_analyze_prompt(transcript_text, video_title)
+        
+        try:
+            if self.provider == "local":
+                return self._query_local_llm(prompt, video_id)  # Local LLM is still synchronous
+            else:
+                return await self._query_openai_async(prompt, video_id)
+        except Exception as e:
+            logger.error(f"Error analyzing transcript: {str(e)}")
+            return {"error": str(e)}
+    
     def _query_local_llm(self, prompt: str, video_id: str) -> Dict[str, Any]:
-        """Query local Mistral LLM instance"""
+        """Query local Mistral LLM instance (synchronous)"""
         url = f"{self.api_base_url}/chat/completions"
         
         payload = {
@@ -210,26 +237,50 @@ INSTRUCTIONS:
             return {"error": str(e)}
     
     def _query_openai(self, prompt: str, video_id: str) -> Dict[str, Any]:
-        """Query OpenAI API"""
+        """Query OpenAI API (synchronous version)"""
         url = f"{self.api_base_url}/chat/completions"
+        
+        # Log the actual API key being used (first 4 and last 4 chars for security)
+        api_key_preview = f"{self.api_key[:4]}...{self.api_key[-4:]}" if len(self.api_key) > 8 else self.api_key
+        logger.info(f"Using OpenAI API key: {api_key_preview}")
         
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json"
         }
         
+        # Log the full Authorization header (first 10 chars for security)
+        auth_header = headers["Authorization"]
+        logger.info(f"Authorization header: {auth_header[:10]}...")
+        
+        # Truncate prompt if it's too long
+        max_tokens = 4000  # Adjust based on model's context window
+        if len(prompt) > max_tokens * 4:  # Rough estimate: 4 chars per token
+            logger.warning(f"Prompt too long ({len(prompt)} chars), truncating to {max_tokens * 4} chars")
+            prompt = prompt[:max_tokens * 4]
+        
         payload = {
-            "model": "gpt-4",  # Can be made configurable
+            "model": "gpt-4-turbo-preview",  # Using the latest GPT-4 model
             "messages": [
                 {"role": "system", "content": "You are a content compliance analyst that evaluates content against specific guidelines."},
                 {"role": "user", "content": prompt}
             ],
             "temperature": 0.1,
-            "response_format": {"type": "json_object"}  # Request JSON format from OpenAI
+            "max_tokens": 1000  # Limit response size
         }
+        
+        # Log the request payload (excluding the full prompt for brevity)
+        logger.debug(f"Request payload: {json.dumps({**payload, 'messages': [{'role': m['role'], 'content_length': len(m['content'])} for m in payload['messages']]})}")
         
         try:
             response = requests.post(url, headers=headers, json=payload)
+            if response.status_code == 401:
+                logger.error(f"OpenAI API unauthorized. Response: {response.text}")
+                # Log the actual request headers that were sent
+                logger.error(f"Request headers sent: {dict(response.request.headers)}")
+            elif response.status_code == 400:
+                logger.error(f"OpenAI API bad request. Response: {response.text}")
+                logger.error(f"Request payload: {json.dumps(payload, indent=2)}")
             response.raise_for_status()
             
             result = response.json()
@@ -251,131 +302,242 @@ INSTRUCTIONS:
                     "results": analysis_results
                 }
             except Exception as e:
-                logger.error(f"Error processing LLM response: {str(e)}")
-                
-                # Include useful debug info
-                return {
-                    "video_id": video_id,
-                    "error": f"Error processing LLM response: {str(e)}",
-                    "results": {
-                        "Content that could lead to death/injury": {
-                            "score": 0.75,
-                            "justification": "Default fallback analysis due to processing error. The system detected potential content that could lead to death/injury.",
-                            "evidence": ["Automated fallback analysis - please review content manually"]
-                        }
-                    }
-                }
+                logger.error(f"Error processing OpenAI response: {str(e)}")
+                return {"error": str(e)}
         except requests.RequestException as e:
             logger.error(f"Error querying OpenAI: {str(e)}")
             return {"error": str(e)}
-            
-    def analyze_channel_content(self, channel_data: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Analyze all videos from a channel
-        
-        Args:
-            channel_data: Dictionary with channel videos and transcripts
-            
-        Returns:
-            Dictionary with analysis results for each video
-        """
-        if not channel_data or 'videos' not in channel_data:
-            return {"error": "Invalid channel data"}
-            
-        channel_analysis = {
-            "channel_id": channel_data.get("channel_id", "unknown"),
-            "video_analyses": [],
-            "summary": {}
-        }
-        
-        # Process each video
-        for video in channel_data['videos']:
-            if 'transcript' not in video:
-                continue
-                
-            video_id = video['id']
-            video_title = video['title']
-            transcript_text = video['transcript']['full_text']
-            
-            # Analyze transcript
-            analysis = self.analyze_transcript(transcript_text, video_title, video_id)
-            
-            channel_analysis['video_analyses'].append({
-                "video_id": video_id,
-                "video_title": video_title,
-                "video_url": video['url'],
-                "analysis": analysis
-            })
-            
-        # Create channel-level summary
-        channel_analysis['summary'] = self._create_channel_summary(channel_analysis['video_analyses'])
-        
-        return channel_analysis
     
-    def _create_channel_summary(self, video_analyses: List[Dict]) -> Dict[str, Any]:
-        """
-        Create a summary of all video analyses for the channel
+    async def _query_openai_async(self, prompt: str, video_id: str) -> Dict[str, Any]:
+        """Query OpenAI API (asynchronous version)"""
+        url = f"{self.api_base_url}/chat/completions"
         
-        Args:
-            video_analyses: List of video analysis results
-            
-        Returns:
-            Dictionary with category scores and evidence across all videos
-        """
-        # Get all category names from the CSV
-        all_categories = self.categories_df['Category'].tolist()
-        
-        # Initialize summary structure
-        summary = {
-            category: {
-                "max_score": 0.0,
-                "average_score": 0.0,
-                "videos_with_violations": 0,
-                "total_videos": len(video_analyses),
-                "examples": []
-            } for category in all_categories
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
         }
         
-        # Process each video analysis
-        for video_analysis in video_analyses:
-            analysis_results = video_analysis.get('analysis', {}).get('results', {})
-            
-            for category in all_categories:
-                if category in analysis_results:
-                    category_data = analysis_results[category]
-                    score = category_data.get('score', 0.0)
-                    
-                    # Update summary data
-                    if score > 0:
-                        summary[category]['videos_with_violations'] += 1
-                        
-                        # Update max score
-                        if score > summary[category]['max_score']:
-                            summary[category]['max_score'] = score
-                            
-                        # Add example
-                        if 'evidence' in category_data and category_data['evidence']:
-                            summary[category]['examples'].append({
-                                "video_id": video_analysis['video_id'],
-                                "video_title": video_analysis['video_title'],
-                                "video_url": video_analysis['video_url'],
-                                "score": score,
-                                "evidence": category_data['evidence'][0] if category_data['evidence'] else ""
-                            })
+        # Truncate prompt if it's too long
+        max_tokens = 4000  # Adjust based on model's context window
+        if len(prompt) > max_tokens * 4:  # Rough estimate: 4 chars per token
+            logger.warning(f"Prompt too long ({len(prompt)} chars), truncating to {max_tokens * 4} chars")
+            prompt = prompt[:max_tokens * 4]
         
-        # Calculate average scores
-        for category in all_categories:
-            violations = summary[category]['videos_with_violations']
-            if violations > 0:
-                # Only count videos with violations in the average
-                total_score = sum(example['score'] for example in summary[category]['examples'])
-                summary[category]['average_score'] = total_score / violations
-                
-            # Sort examples by score (highest first)
-            summary[category]['examples'] = sorted(
-                summary[category]['examples'], 
-                key=lambda x: x['score'], 
-                reverse=True
-            )[:3]  # Keep only top 3 examples
+        payload = {
+            "model": "gpt-4-turbo-preview",  # Using the latest GPT-4 model
+            "messages": [
+                {"role": "system", "content": "You are a content compliance analyst that evaluates content against specific guidelines."},
+                {"role": "user", "content": prompt}
+            ],
+            "temperature": 0.1,
+            "max_tokens": 1000  # Limit response size
+        }
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, headers=headers, json=payload) as response:
+                    if response.status == 401:
+                        logger.error(f"OpenAI API unauthorized. Response: {await response.text()}")
+                        # Log the actual request headers that were sent
+                        logger.error(f"Request headers sent: {dict(response.request_info.headers)}")
+                    elif response.status == 400:
+                        logger.error(f"OpenAI API bad request. Response: {await response.text()}")
+                        logger.error(f"Request payload: {json.dumps(payload, indent=2)}")
+                    response.raise_for_status()
+                    
+                    result = await response.json()
+                    content = result.get("choices", [{}])[0].get("message", {}).get("content", "{}")
+                    
+                    # Try to extract valid JSON
+                    try:
+                        # Extract valid JSON
+                        analysis_results = self._extract_valid_json(content)
+                        
+                        # Filter out categories with score=0
+                        analysis_results = {
+                            category: data for category, data in analysis_results.items()
+                            if data.get('score', 0) > 0
+                        }
+                        
+                        return {
+                            "video_id": video_id,
+                            "results": analysis_results
+                        }
+                    except Exception as e:
+                        logger.error(f"Error processing OpenAI response: {str(e)}")
+                        return {"error": str(e)}
+        except Exception as e:
+            logger.error(f"Error querying OpenAI: {str(e)}")
+            return {"error": str(e)}
+    
+    def analyze_channel_content(self, channel_data):
+        """Analyze content from multiple videos in a channel"""
+        try:
+            # Initialize results structure
+            results = {
+                "channel_id": channel_data.get('channel_id'),
+                "video_analyses": [],
+                "summary": {}
+            }
             
-        return summary 
+            # Process each video
+            for video in channel_data.get('videos', []):
+                if not video.get('transcript'):
+                    continue
+                    
+                # Analyze the video
+                analysis = self.analyze_transcript(
+                    transcript_text=video['transcript']['full_text'],
+                    video_title=video.get('title', 'Unknown Title'),
+                    video_id=video.get('id', 'unknown')
+                )
+                
+                # Add to results
+                results["video_analyses"].append({
+                    "video_id": video.get('id', 'unknown'),
+                    "video_title": video.get('title', 'Unknown Title'),
+                    "video_url": video.get('url', ''),
+                    "analysis": analysis
+                })
+            
+            # Create summary across all videos
+            summary = {}
+            for category in self.categories_df['Category'].tolist():
+                category_violations = []
+                max_score = 0
+                total_score = 0
+                videos_with_violations = 0
+                
+                for video_analysis in results["video_analyses"]:
+                    if category in video_analysis["analysis"].get("results", {}):
+                        violation = video_analysis["analysis"]["results"][category]
+                        score = violation.get("score", 0)
+                        
+                        if score > 0:
+                            videos_with_violations += 1
+                            max_score = max(max_score, score)
+                            total_score += score
+                            
+                            category_violations.append({
+                                "video_id": video_analysis["video_id"],
+                                "video_title": video_analysis["video_title"],
+                                "video_url": video_analysis["video_url"],
+                                "score": score,
+                                "evidence": violation.get("evidence", [])[0] if violation.get("evidence") else ""
+                            })
+                
+                if videos_with_violations > 0:
+                    summary[category] = {
+                        "max_score": max_score,
+                        "average_score": total_score / videos_with_violations,
+                        "videos_with_violations": videos_with_violations,
+                        "total_videos": len(results["video_analyses"]),
+                        "examples": sorted(category_violations, key=lambda x: x["score"], reverse=True)[:5]
+                    }
+            
+            results["summary"] = summary
+            return results
+            
+        except Exception as e:
+            logger.error(f"Error analyzing channel content: {str(e)}")
+            raise
+    
+    async def analyze_channel_content_async(self, channel_data):
+        """Analyze content from multiple videos in a channel using async processing"""
+        try:
+            # Initialize results structure
+            results = {
+                "channel_id": channel_data.get('channel_id'),
+                "video_analyses": [],
+                "summary": {}
+            }
+            
+            if self.provider == "openai":
+                # For OpenAI, process videos in parallel
+                tasks = []
+                for video in channel_data.get('videos', []):
+                    if not video.get('transcript'):
+                        continue
+                    tasks.append(self.analyze_transcript_async(
+                        transcript_text=video['transcript']['full_text'],
+                        video_title=video.get('title', 'Unknown Title'),
+                        video_id=video.get('id', 'unknown')
+                    ))
+                
+                # Wait for all analyses to complete
+                analyses = await asyncio.gather(*tasks, return_exceptions=True)
+                
+                # Process results
+                for video, analysis in zip([v for v in channel_data.get('videos', []) if v.get('transcript')], analyses):
+                    if isinstance(analysis, Exception):
+                        logger.error(f"Error analyzing video {video.get('id')}: {str(analysis)}")
+                        continue
+                        
+                    results["video_analyses"].append({
+                        "video_id": video.get('id', 'unknown'),
+                        "video_title": video.get('title', 'Unknown Title'),
+                        "video_url": video.get('url', ''),
+                        "analysis": analysis
+                    })
+            else:
+                # For local LLM, process videos sequentially for easier debugging
+                for video in channel_data.get('videos', []):
+                    if not video.get('transcript'):
+                        continue
+                        
+                    # Analyze the video
+                    analysis = self.analyze_transcript(
+                        transcript_text=video['transcript']['full_text'],
+                        video_title=video.get('title', 'Unknown Title'),
+                        video_id=video.get('id', 'unknown')
+                    )
+                    
+                    # Add to results
+                    results["video_analyses"].append({
+                        "video_id": video.get('id', 'unknown'),
+                        "video_title": video.get('title', 'Unknown Title'),
+                        "video_url": video.get('url', ''),
+                        "analysis": analysis
+                    })
+            
+            # Create summary across all videos
+            summary = {}
+            for category in self.categories_df['Category'].tolist():
+                category_violations = []
+                max_score = 0
+                total_score = 0
+                videos_with_violations = 0
+                
+                for video_analysis in results["video_analyses"]:
+                    if category in video_analysis["analysis"].get("results", {}):
+                        violation = video_analysis["analysis"]["results"][category]
+                        score = violation.get("score", 0)
+                        
+                        if score > 0:
+                            videos_with_violations += 1
+                            max_score = max(max_score, score)
+                            total_score += score
+                            
+                            category_violations.append({
+                                "video_id": video_analysis["video_id"],
+                                "video_title": video_analysis["video_title"],
+                                "video_url": video_analysis["video_url"],
+                                "score": score,
+                                "evidence": violation.get("evidence", [])[0] if violation.get("evidence") else ""
+                            })
+                
+                if videos_with_violations > 0:
+                    summary[category] = {
+                        "max_score": max_score,
+                        "average_score": total_score / videos_with_violations,
+                        "videos_with_violations": videos_with_violations,
+                        "total_videos": len(results["video_analyses"]),
+                        "examples": sorted(category_violations, key=lambda x: x["score"], reverse=True)[:5]
+                    }
+            
+            results["summary"] = summary
+            return results
+            
+        except Exception as e:
+            logger.error(f"Error analyzing channel content: {str(e)}")
+            raise 

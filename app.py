@@ -14,15 +14,38 @@ import asyncio
 from youtube_analyzer import YouTubeAnalyzer
 from llm_analyzer import LLMAnalyzer
 
-# Load environment variables
-load_dotenv()
-
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+# Load environment variables
+logger.info("Loading environment variables...")
+env_path = os.path.join(os.path.dirname(__file__), '.env')
+logger.info(f"Looking for .env file at: {env_path}")
+
+# Force reload of environment variables
+if os.path.exists(env_path):
+    logger.info("Found .env file, loading variables...")
+    # Force reload of environment variables
+    load_dotenv(env_path, override=True)
+    
+    # Verify the API key was loaded
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key or api_key == "your_openai_api_key_here":
+        logger.error("Invalid or missing OpenAI API key in .env file")
+        logger.error("Please ensure your .env file contains a valid OPENAI_API_KEY")
+        raise ValueError("Invalid or missing OpenAI API key in .env file")
+    
+    # Log the API key that was loaded (first 4 and last 4 chars for security)
+    api_key_preview = f"{api_key[:4]}...{api_key[-4:]}" if len(api_key) > 8 else api_key
+    logger.info(f"Loaded OpenAI API key: {api_key_preview}")
+else:
+    logger.error(f"No .env file found at {env_path}")
+    logger.error("Please create a .env file with your OpenAI API key")
+    raise ValueError("No .env file found")
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -54,12 +77,19 @@ class MultipleURLsRequest(BaseModel):
     urls: List[str]
     llm_provider: Optional[str] = "local"  # "local" or "openai"
 
+class CreatorAnalysisRequest(BaseModel):
+    creator_url: HttpUrl
+    video_limit: Optional[int] = 10
+    llm_provider: Optional[str] = "local"  # "local" or "openai"
+
 # Response models
 class ErrorResponse(BaseModel):
     error: str
 
 class AnalysisResponse(BaseModel):
     channel_id: Optional[str] = None
+    channel_name: Optional[str] = None
+    channel_handle: Optional[str] = None
     video_analyses: Optional[List[Dict[str, Any]]] = None
     summary: Optional[Dict[str, Any]] = None
     
@@ -90,12 +120,18 @@ async def analyze_channel(request: ChannelAnalysisRequest):
         if not channel_data.get('videos'):
             return {
                 "channel_id": channel_data.get('channel_id', "unknown"),
+                "channel_name": channel_data.get('channel_name', "Unknown"),
+                "channel_handle": channel_data.get('channel_handle', "Unknown"),
                 "video_analyses": [],
                 "summary": {}
             }
             
         # Analyze content against compliance categories
         analysis_results = llm_analyzer.analyze_channel_content(channel_data)
+        
+        # Add channel name and handle to the response
+        analysis_results["channel_name"] = channel_data.get('channel_name', "Unknown")
+        analysis_results["channel_handle"] = channel_data.get('channel_handle', "Unknown")
         
         return analysis_results
     except Exception as e:
@@ -145,6 +181,8 @@ async def analyze_video(request: VideoAnalysisRequest):
             # Return a partial result with video info but no analysis
             return {
                 "channel_id": channel_id,
+                "channel_name": None,
+                "channel_handle": None,
                 "video_analyses": [{
                     "video_id": video_id,
                     "video_title": title,
@@ -174,6 +212,8 @@ async def analyze_video(request: VideoAnalysisRequest):
         
         return {
             "channel_id": channel_id,
+            "channel_name": None,
+            "channel_handle": None,
             "video_analyses": [{
                 "video_id": video_id,
                 "video_title": title,
@@ -201,6 +241,47 @@ async def analyze_video(request: VideoAnalysisRequest):
         }
     except Exception as e:
         logger.error(f"Error analyzing video: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/analyze-creator", response_model=AnalysisResponse)
+async def analyze_creator(request: CreatorAnalysisRequest):
+    """
+    Analyze a YouTube creator's recent videos for content compliance
+    """
+    try:
+        # Initialize LLM analyzer with specified provider
+        llm_analyzer = LLMAnalyzer(provider=request.llm_provider)
+        
+        # Convert HttpUrl to string
+        creator_url = str(request.creator_url).strip()
+        logger.info(f"Analyzing creator URL: {creator_url}")
+        
+        # Get channel data (videos and transcripts)
+        channel_data = youtube_analyzer.analyze_channel(creator_url, video_limit=request.video_limit)
+        
+        if not channel_data:
+            raise HTTPException(status_code=404, detail="Could not extract channel data")
+            
+        # If no videos with transcripts were found
+        if not channel_data.get('videos'):
+            return {
+                "channel_id": channel_data.get('channel_id', "unknown"),
+                "channel_name": channel_data.get('channel_name', "Unknown"),
+                "channel_handle": channel_data.get('channel_handle', "Unknown"),
+                "video_analyses": [],
+                "summary": {}
+            }
+            
+        # Analyze content against compliance categories using async processing
+        analysis_results = await llm_analyzer.analyze_channel_content_async(channel_data)
+        
+        # Add channel name and handle to the response
+        analysis_results["channel_name"] = channel_data.get('channel_name', "Unknown")
+        analysis_results["channel_handle"] = channel_data.get('channel_handle', "Unknown")
+        
+        return analysis_results
+    except Exception as e:
+        logger.error(f"Error analyzing creator: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/analyze-multiple")
