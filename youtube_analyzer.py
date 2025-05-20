@@ -8,8 +8,9 @@ import aiohttp
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse, parse_qs
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
+from pytube import YouTube
 import logging
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -112,32 +113,70 @@ class YouTubeAnalyzer:
         """Get channel info from a video ID by scraping the video page"""
         try:
             url = f"https://www.youtube.com/watch?v={video_id}"
-            response = requests.get(url)
-            soup = BeautifulSoup(response.text, 'html.parser')
+            logger.debug(f"Fetching video page: {url}")
             
+            # Add headers to mimic a browser request
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            }
+            
+            response = requests.get(url, headers=headers)
+            response.raise_for_status()  # Raise exception for bad status codes
+            
+            soup = BeautifulSoup(response.text, 'html.parser')
             channel_info = {}
             
-            # Get channel ID
-            for link in soup.find_all('a'):
-                href = link.get('href', '')
-                if '/channel/' in href:
-                    channel_info['channel_id'] = href.split('/channel/')[1].split('/')[0]
+            # Method 1: Look for channel ID in meta tags
+            for meta in soup.find_all('meta'):
+                if meta.get('itemprop') == 'channelId':
+                    channel_info['channel_id'] = meta.get('content')
                     break
             
-            # Get channel name and handle
-            channel_link = soup.find('a', {'class': 'yt-simple-endpoint style-scope yt-formatted-string'})
-            if channel_link:
-                channel_info['channel_name'] = channel_link.text.strip()
-                href = channel_link.get('href', '')
-                if '/@' in href:
-                    channel_info['channel_handle'] = href.split('/@')[1].split('/')[0]
-                elif '/c/' in href:
-                    channel_info['channel_handle'] = href.split('/c/')[1].split('/')[0]
+            # Method 2: Look for channel link
+            if not channel_info.get('channel_id'):
+                channel_link = soup.find('a', {'class': 'yt-simple-endpoint style-scope yt-formatted-string'})
+                if channel_link:
+                    href = channel_link.get('href', '')
+                    if '/channel/' in href:
+                        channel_info['channel_id'] = href.split('/channel/')[1].split('/')[0]
+                    elif '/@' in href:
+                        channel_info['channel_handle'] = href.split('/@')[1].split('/')[0]
+                    elif '/c/' in href:
+                        channel_info['channel_handle'] = href.split('/c/')[1].split('/')[0]
+                    channel_info['channel_name'] = channel_link.text.strip()
             
-            return channel_info if channel_info.get('channel_id') else None
+            # Method 3: Look for channel ID in script tags
+            if not channel_info.get('channel_id'):
+                for script in soup.find_all('script'):
+                    script_text = str(script)
+                    if 'channelId' in script_text:
+                        # Try to find channelId in the script
+                        match = re.search(r'"channelId":"([^"]+)"', script_text)
+                        if match:
+                            channel_info['channel_id'] = match.group(1)
+                            break
             
+            # Method 4: Look for channel name in page title
+            if not channel_info.get('channel_name'):
+                title_tag = soup.find('title')
+                if title_tag:
+                    # YouTube titles are usually "Video Title - Channel Name - YouTube"
+                    title_parts = title_tag.text.split(' - ')
+                    if len(title_parts) >= 2:
+                        channel_info['channel_name'] = title_parts[-2]
+            
+            if not channel_info.get('channel_id'):
+                logger.error(f"Could not find channel ID in video page: {url}")
+                return None
+                
+            logger.info(f"Successfully extracted channel info: {channel_info}")
+            return channel_info
+            
+        except requests.RequestException as e:
+            logger.error(f"Error fetching video page: {str(e)}")
+            return None
         except Exception as e:
-            logger.error(f"Error getting channel info from video: {str(e)}")
+            logger.error(f"Error extracting channel info: {str(e)}")
             return None
             
     def _get_videos_by_scraping(self, channel_id, limit):
@@ -285,18 +324,70 @@ class YouTubeAnalyzer:
                 logger.error(f"Error fetching transcript for video {video_id}: {str(e)}")
                 return None
 
-    async def analyze_channel_async(self, channel_url: str, video_limit: int = 10, use_concurrent: bool = False) -> Optional[Dict[str, Any]]:
+    def normalize_url(self, url: str) -> Tuple[str, str]:
         """
-        Analyze a channel by collecting transcripts from its videos asynchronously
+        Normalize a YouTube URL to a channel URL.
+        If input is a video URL, extracts the channel URL.
+        If input is already a channel URL, returns it unchanged.
+        
+        Returns:
+            Tuple[str, str]: (normalized_url, url_type) where url_type is either 'channel' or 'video'
+        """
+        try:
+            # Check if it's a video URL
+            if 'youtube.com/watch' in url or 'youtu.be/' in url:
+                logger.info(f"Input URL is a video URL: {url}")
+                # Extract video ID
+                if 'youtube.com/watch' in url:
+                    video_id = parse_qs(urlparse(url).query).get('v', [None])[0]
+                else:  # youtu.be/
+                    video_id = urlparse(url).path.lstrip('/')
+                
+                if not video_id:
+                    logger.error(f"Could not extract video ID from URL: {url}")
+                    return url, 'unknown'
+                
+                # Get channel info using our existing method
+                channel_info = self.get_channel_info_from_video(video_id)
+                if not channel_info or not channel_info.get('channel_id'):
+                    logger.error(f"Could not get channel info for video: {video_id}")
+                    return url, 'unknown'
+                
+                # Construct channel URL
+                channel_url = f"https://www.youtube.com/channel/{channel_info['channel_id']}"
+                logger.info(f"Extracted channel URL: {channel_url}")
+                return channel_url, 'video'
+            
+            # Check if it's a channel URL
+            if any(pattern in url for pattern in ['youtube.com/channel/', 'youtube.com/c/', 'youtube.com/@', 'youtube.com/user/']):
+                logger.info(f"Input URL is already a channel URL: {url}")
+                return url, 'channel'
+            
+            logger.warning(f"Unrecognized URL format: {url}")
+            return url, 'unknown'
+            
+        except Exception as e:
+            logger.error(f"Error normalizing URL {url}: {str(e)}")
+            return url, 'unknown'
+
+    async def analyze_channel_async(self, url: str, video_limit: int = 10, use_concurrent: bool = False) -> Optional[Dict[str, Any]]:
+        """
+        Analyze a channel by collecting transcripts from its videos asynchronously.
+        Can handle both channel URLs and video URLs.
         
         Args:
-            channel_url: URL of the YouTube channel
+            url: URL of the YouTube channel or video
             video_limit: Maximum number of videos to analyze
             use_concurrent: Whether to use concurrent processing (for OpenAI)
         """
-        channel_id, channel_name, channel_handle = self.extract_channel_info_from_url(channel_url)
+        # Normalize URL if it's a video URL
+        normalized_url, url_type = self.normalize_url(url)
+        if url_type == 'video':
+            logger.info(f"Converting video URL to channel URL for analysis")
+        
+        channel_id, channel_name, channel_handle = self.extract_channel_info_from_url(normalized_url)
         if not channel_id:
-            logger.error(f"Could not extract channel ID from {channel_url}")
+            logger.error(f"Could not extract channel ID from {normalized_url}")
             return None
             
         videos = self.get_videos_from_channel(channel_id, limit=video_limit)
