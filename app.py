@@ -522,10 +522,24 @@ async def process_creator(url: str, video_limit: int, llm_provider: str, job_id:
             
         # If no videos with transcripts were found
         if not channel_data.get('videos'):
+            # Safely handle channel name and handle
+            channel_name = channel_data.get('channel_name', '')
+            channel_handle = channel_data.get('channel_handle', '')
+            
+            # Remove @ if present and ensure we have a valid string
+            if isinstance(channel_name, str):
+                channel_name = channel_name.replace('@', '')
+            if isinstance(channel_handle, str):
+                channel_handle = channel_handle.replace('@', '')
+                
+            # Use channel ID as fallback for name if needed
+            if not channel_name and channel_data.get('channel_id'):
+                channel_name = f"Channel {channel_data['channel_id']}"
+            
             analysis_results[job_id]['results'][str(url)] = {
                 "channel_id": channel_data.get('channel_id', "unknown"),
-                "channel_name": channel_data.get('channel_name', "Unknown"),
-                "channel_handle": channel_data.get('channel_handle', "Unknown"),
+                "channel_name": channel_name or "Unknown",
+                "channel_handle": channel_handle or "Unknown",
                 "video_analyses": [],
                 "summary": {}
             }
@@ -533,7 +547,33 @@ async def process_creator(url: str, video_limit: int, llm_provider: str, job_id:
             return
             
         # Analyze content
-        analysis_results[job_id]['results'][str(url)] = await llm_analyzer.analyze_channel_content_async(channel_data)
+        analysis_result = await llm_analyzer.analyze_channel_content_async(channel_data)
+        
+        # Safely handle channel name and handle
+        channel_name = channel_data.get('channel_name', '')
+        channel_handle = channel_data.get('channel_handle', '')
+        
+        # Remove @ if present and ensure we have a valid string
+        if isinstance(channel_name, str):
+            channel_name = channel_name.replace('@', '')
+        if isinstance(channel_handle, str):
+            channel_handle = channel_handle.replace('@', '')
+            
+        # Use channel ID as fallback for name if needed
+        if not channel_name and channel_data.get('channel_id'):
+            channel_name = f"Channel {channel_data['channel_id']}"
+        
+        # Ensure we have the full channel details
+        analysis_result.update({
+            "channel_id": channel_data.get('channel_id', "unknown"),
+            "channel_name": channel_name or "Unknown",
+            "channel_handle": channel_handle or "Unknown",
+            "video_analyses": analysis_result.get('video_analyses', []),
+            "summary": analysis_result.get('summary', {})
+        })
+        
+        # Store the complete result
+        analysis_results[job_id]['results'][str(url)] = analysis_result
         analysis_results[job_id]['processed_urls'] += 1
         
     except Exception as e:
@@ -549,8 +589,8 @@ async def process_bulk_analysis(urls: List[str], video_limit: int, llm_provider:
     try:
         # If using OpenAI, process in smaller batches to avoid rate limits
         if llm_provider == "openai":
-            # Process in batches of 3 to avoid rate limits
-            batch_size = 3
+            # Process in batches of 2 to avoid rate limits
+            batch_size = 2
             for i in range(0, len(urls), batch_size):
                 batch = urls[i:i + batch_size]
                 tasks = []
@@ -561,9 +601,9 @@ async def process_bulk_analysis(urls: List[str], video_limit: int, llm_provider:
                 # Wait for batch to complete
                 await asyncio.gather(*tasks)
                 
-                # Add a small delay between batches to avoid rate limits
+                # Add a delay between batches to avoid rate limits
                 if i + batch_size < len(urls):
-                    await asyncio.sleep(2)  # 2 second delay between batches
+                    await asyncio.sleep(5)  # 5 second delay between batches
         else:
             # For non-OpenAI providers, process all at once
             tasks = []

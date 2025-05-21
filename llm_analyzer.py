@@ -260,7 +260,7 @@ INSTRUCTIONS:
             prompt = prompt[:max_tokens * 4]
         
         payload = {
-            "model": "gpt-4-turbo-preview",  # Using the latest GPT-4 model
+            "model": "gpt-4o-mini",  # Using GPT-4o-mini model
             "messages": [
                 {"role": "system", "content": "You are a content compliance analyst that evaluates content against specific guidelines."},
                 {"role": "user", "content": prompt}
@@ -324,7 +324,7 @@ INSTRUCTIONS:
             prompt = prompt[:max_tokens * 4]
         
         payload = {
-            "model": "gpt-4-turbo-preview",  # Using the latest GPT-4 model
+            "model": "gpt-4o-mini",  # Using GPT-4o-mini model
             "messages": [
                 {"role": "system", "content": "You are a content compliance analyst that evaluates content against specific guidelines."},
                 {"role": "user", "content": prompt}
