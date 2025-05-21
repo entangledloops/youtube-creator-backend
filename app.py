@@ -186,6 +186,17 @@ async def analyze_video(request: VideoAnalysisRequest):
         channel_id = youtube_analyzer.get_channel_id_from_video(video_id)
         logger.info(f"Retrieved channel ID: {channel_id}")
         
+        # Get channel name and handle
+        channel_name = "Unknown"
+        channel_handle = "Unknown"
+        try:
+            channel_data = youtube_analyzer.get_channel_info(channel_id)
+            if channel_data:
+                channel_name = channel_data.get('channel_name', '').replace('@', '') or "Unknown"
+                channel_handle = channel_data.get('channel_handle', '').replace('@', '') or "Unknown"
+        except Exception as e:
+            logger.warning(f"Could not get channel info: {str(e)}")
+        
         # Get video transcript
         transcript = youtube_analyzer.get_transcript(video_id)
         if not transcript:
@@ -193,8 +204,8 @@ async def analyze_video(request: VideoAnalysisRequest):
             # Return a partial result with video info but no analysis
             return {
                 "channel_id": channel_id,
-                "channel_name": None,
-                "channel_handle": None,
+                "channel_name": channel_name,
+                "channel_handle": channel_handle,
                 "video_analyses": [{
                     "video_id": video_id,
                     "video_title": title,
@@ -224,8 +235,8 @@ async def analyze_video(request: VideoAnalysisRequest):
         
         return {
             "channel_id": channel_id,
-            "channel_name": None,
-            "channel_handle": None,
+            "channel_name": channel_name,
+            "channel_handle": channel_handle,
             "video_analyses": [{
                 "video_id": video_id,
                 "video_title": title,
@@ -282,10 +293,24 @@ async def analyze_creator(request: CreatorAnalysisRequest):
             
         # If no videos with transcripts were found
         if not channel_data.get('videos'):
+            # Safely handle channel name and handle
+            channel_name = channel_data.get('channel_name', '')
+            channel_handle = channel_data.get('channel_handle', '')
+            
+            # Remove @ if present and ensure we have a valid string
+            if isinstance(channel_name, str):
+                channel_name = channel_name.replace('@', '')
+            if isinstance(channel_handle, str):
+                channel_handle = channel_handle.replace('@', '')
+                
+            # Use channel ID as fallback for name if needed
+            if not channel_name and channel_data.get('channel_id'):
+                channel_name = f"Channel {channel_data['channel_id']}"
+            
             return {
                 "channel_id": channel_data.get('channel_id', "unknown"),
-                "channel_name": channel_data.get('channel_name', "Unknown"),
-                "channel_handle": channel_data.get('channel_handle', "Unknown"),
+                "channel_name": channel_name or "Unknown",
+                "channel_handle": channel_handle or "Unknown",
                 "video_analyses": [],
                 "summary": {}
             }
@@ -293,9 +318,28 @@ async def analyze_creator(request: CreatorAnalysisRequest):
         # Analyze content against compliance categories using async processing
         analysis_results = await llm_analyzer.analyze_channel_content_async(channel_data)
         
-        # Add channel name and handle to the response
-        analysis_results["channel_name"] = channel_data.get('channel_name', "Unknown")
-        analysis_results["channel_handle"] = channel_data.get('channel_handle', "Unknown")
+        # Safely handle channel name and handle
+        channel_name = channel_data.get('channel_name', '')
+        channel_handle = channel_data.get('channel_handle', '')
+        
+        # Remove @ if present and ensure we have a valid string
+        if isinstance(channel_name, str):
+            channel_name = channel_name.replace('@', '')
+        if isinstance(channel_handle, str):
+            channel_handle = channel_handle.replace('@', '')
+            
+        # Use channel ID as fallback for name if needed
+        if not channel_name and channel_data.get('channel_id'):
+            channel_name = f"Channel {channel_data['channel_id']}"
+        
+        # Ensure we have the full channel details
+        analysis_results.update({
+            "channel_id": channel_data.get('channel_id', "unknown"),
+            "channel_name": channel_name or "Unknown",
+            "channel_handle": channel_handle or "Unknown",
+            "video_analyses": analysis_results.get('video_analyses', []),
+            "summary": analysis_results.get('summary', {})
+        })
         
         return analysis_results
     except Exception as e:
