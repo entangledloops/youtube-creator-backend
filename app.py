@@ -3,13 +3,18 @@ FastAPI application for YouTube content compliance analysis
 """
 import os
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, UploadFile, File, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, HttpUrl
 from typing import Optional, List, Dict, Any
 import logging
 import uvicorn
 import asyncio
+import pandas as pd
+import uuid
+from datetime import datetime
+import json
 
 from youtube_analyzer import YouTubeAnalyzer
 from llm_analyzer import LLMAnalyzer
@@ -79,23 +84,30 @@ class MultipleURLsRequest(BaseModel):
 
 class CreatorAnalysisRequest(BaseModel):
     creator_url: HttpUrl
-    video_limit: Optional[int] = 10
-    llm_provider: Optional[str] = "local"  # "local" or "openai"
+    video_limit: int = 10
+    llm_provider: str = "openai"
+
+class BulkAnalysisRequest(BaseModel):
+    video_limit: int = 10
+    llm_provider: str = "openai"
 
 # Response models
 class ErrorResponse(BaseModel):
     error: str
 
 class AnalysisResponse(BaseModel):
-    channel_id: Optional[str] = None
-    channel_name: Optional[str] = None
-    channel_handle: Optional[str] = None
-    video_analyses: Optional[List[Dict[str, Any]]] = None
-    summary: Optional[Dict[str, Any]] = None
-    
+    channel_id: str
+    channel_name: str
+    channel_handle: str
+    video_analyses: List[dict]
+    summary: dict
+
 # Initialize analyzers
 youtube_api_key = os.getenv("YOUTUBE_API_KEY")
 youtube_analyzer = YouTubeAnalyzer(youtube_api_key=youtube_api_key)
+
+# Store for bulk analysis results
+analysis_results = {}
 
 @app.get("/")
 async def root():
@@ -486,6 +498,252 @@ async def get_categories():
     except Exception as e:
         logger.error(f"Error getting categories: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+async def process_creator(url: str, video_limit: int, llm_provider: str, job_id: str):
+    """Process a single creator and store results"""
+    try:
+        # Initialize LLM analyzer with specified provider
+        llm_analyzer = LLMAnalyzer(provider=llm_provider)
+        
+        # Get channel data
+        channel_data = await youtube_analyzer.analyze_channel_async(
+            str(url), 
+            video_limit=video_limit,
+            use_concurrent=(llm_provider == "openai")
+        )
+        
+        if not channel_data:
+            analysis_results[job_id]['failed_urls'].append({
+                'url': str(url),
+                'error': 'Could not extract channel data'
+            })
+            analysis_results[job_id]['processed_urls'] += 1
+            return
+            
+        # If no videos with transcripts were found
+        if not channel_data.get('videos'):
+            analysis_results[job_id]['results'][str(url)] = {
+                "channel_id": channel_data.get('channel_id', "unknown"),
+                "channel_name": channel_data.get('channel_name', "Unknown"),
+                "channel_handle": channel_data.get('channel_handle', "Unknown"),
+                "video_analyses": [],
+                "summary": {}
+            }
+            analysis_results[job_id]['processed_urls'] += 1
+            return
+            
+        # Analyze content
+        analysis_results[job_id]['results'][str(url)] = await llm_analyzer.analyze_channel_content_async(channel_data)
+        analysis_results[job_id]['processed_urls'] += 1
+        
+    except Exception as e:
+        logger.error(f"Error processing creator {url}: {str(e)}")
+        analysis_results[job_id]['failed_urls'].append({
+            'url': str(url),
+            'error': str(e)
+        })
+        analysis_results[job_id]['processed_urls'] += 1
+
+async def process_bulk_analysis(urls: List[str], video_limit: int, llm_provider: str, job_id: str):
+    """Process multiple URLs in parallel with rate limiting"""
+    try:
+        # If using OpenAI, process in smaller batches to avoid rate limits
+        if llm_provider == "openai":
+            # Process in batches of 3 to avoid rate limits
+            batch_size = 3
+            for i in range(0, len(urls), batch_size):
+                batch = urls[i:i + batch_size]
+                tasks = []
+                for url in batch:
+                    task = process_creator(url, video_limit, llm_provider, job_id)
+                    tasks.append(task)
+                
+                # Wait for batch to complete
+                await asyncio.gather(*tasks)
+                
+                # Add a small delay between batches to avoid rate limits
+                if i + batch_size < len(urls):
+                    await asyncio.sleep(2)  # 2 second delay between batches
+        else:
+            # For non-OpenAI providers, process all at once
+            tasks = []
+            for url in urls:
+                task = process_creator(url, video_limit, llm_provider, job_id)
+                tasks.append(task)
+            await asyncio.gather(*tasks)
+        
+        # Verify all URLs were processed
+        total_processed = len(analysis_results[job_id]['results']) + len(analysis_results[job_id]['failed_urls'])
+        if total_processed != len(urls):
+            logger.warning(f"Job {job_id}: Processed {total_processed} URLs but expected {len(urls)}")
+        
+        # Mark job as complete
+        analysis_results[job_id]['status'] = 'completed'
+        analysis_results[job_id]['completed_at'] = datetime.now().isoformat()
+        analysis_results[job_id]['processed_urls'] = total_processed
+        
+    except Exception as e:
+        logger.error(f"Error in bulk processing: {str(e)}")
+        analysis_results[job_id]['status'] = 'failed'
+        analysis_results[job_id]['error'] = str(e)
+        analysis_results[job_id]['completed_at'] = datetime.now().isoformat()
+
+@app.post("/api/bulk-analyze")
+async def bulk_analyze(
+    file: UploadFile = File(...),
+    request: BulkAnalysisRequest = None,
+    background_tasks: BackgroundTasks = None
+):
+    """Bulk analyze multiple YouTube creators from a CSV file.
+    The file can be a single column of URLs with or without a header.
+    """
+    try:
+        # Read CSV file with flexible header handling
+        try:
+            # First try with header
+            df = pd.read_csv(file.file)
+            # If we have a header, use the first column regardless of its name
+            urls = df.iloc[:, 0].tolist()
+        except:
+            # If that fails, try without header
+            file.file.seek(0)  # Reset file pointer
+            df = pd.read_csv(file.file, header=None)
+            urls = df.iloc[:, 0].tolist()
+            
+        # Clean and validate URLs
+        cleaned_urls = []
+        for url in urls:
+            url = str(url).strip()
+            if url and (url.startswith('http://') or url.startswith('https://')):
+                cleaned_urls.append(url)
+            else:
+                logger.warning(f"Skipping invalid URL: {url}")
+                
+        if not cleaned_urls:
+            raise HTTPException(status_code=400, detail="No valid URLs found in file")
+            
+        logger.info(f"Found {len(cleaned_urls)} valid URLs to process")
+            
+        # Generate unique job ID
+        job_id = str(uuid.uuid4())
+        
+        # Initialize results storage
+        analysis_results[job_id] = {
+            'status': 'processing',
+            'started_at': datetime.now().isoformat(),
+            'total_urls': len(cleaned_urls),
+            'processed_urls': 0,
+            'results': {},
+            'failed_urls': []
+        }
+        
+        # Start processing in background
+        background_tasks.add_task(
+            process_bulk_analysis,
+            cleaned_urls,
+            request.video_limit if request else 10,
+            request.llm_provider if request else "openai",
+            job_id
+        )
+        
+        return {
+            "job_id": job_id,
+            "total_urls": len(cleaned_urls),
+            "status": "processing"
+        }
+        
+    except Exception as e:
+        logger.error(f"Error in bulk analysis: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/bulk-analyze/{job_id}")
+async def get_bulk_analysis_status(job_id: str):
+    """Get status of a bulk analysis job"""
+    if job_id not in analysis_results:
+        raise HTTPException(status_code=404, detail="Job not found")
+        
+    job = analysis_results[job_id]
+    return {
+        "job_id": job_id,
+        "status": job['status'],
+        "started_at": job['started_at'],
+        "total_urls": job['total_urls'],
+        "processed_urls": len(job['results']) + len(job['failed_urls']),
+        "failed_urls": job['failed_urls']
+    }
+
+@app.get("/api/bulk-analyze/{job_id}/results")
+async def get_bulk_analysis_results(job_id: str):
+    """Get detailed results of a bulk analysis job"""
+    if job_id not in analysis_results:
+        raise HTTPException(status_code=404, detail="Job not found")
+        
+    job = analysis_results[job_id]
+    if job['status'] == 'processing':
+        raise HTTPException(status_code=400, detail="Analysis still in progress")
+        
+    return {
+        "job_id": job_id,
+        "status": job['status'],
+        "started_at": job['started_at'],
+        "completed_at": job.get('completed_at'),
+        "total_urls": job['total_urls'],
+        "processed_urls": job['processed_urls'],
+        "results": job['results'],
+        "failed_urls": job['failed_urls']
+    }
+
+@app.get("/api/bulk-analyze/{job_id}/csv")
+async def download_bulk_analysis_csv(job_id: str):
+    """Download bulk analysis results as CSV"""
+    if job_id not in analysis_results:
+        raise HTTPException(status_code=404, detail="Job not found")
+        
+    job = analysis_results[job_id]
+    if job['status'] == 'processing':
+        raise HTTPException(status_code=400, detail="Analysis still in progress")
+        
+    # Get all categories
+    categories_df = pd.read_csv("YouTube_Controversy_Categories.csv")
+    all_categories = categories_df['Category'].tolist()
+        
+    # Convert results to DataFrame
+    rows = []
+    for url, result in job['results'].items():
+        row = {
+            'url': url,
+            'channel_id': result.get('channel_id', ''),
+            'channel_name': result.get('channel_name', ''),
+            'channel_handle': result.get('channel_handle', ''),
+            'overall_score': 0.0  # Will be calculated
+        }
+        
+        # Initialize all categories with 0.0
+        for category in all_categories:
+            row[category] = 0.0
+            
+        # Add category scores from results
+        for category, data in result.get('summary', {}).items():
+            if category in all_categories:  # Only include valid categories
+                score = round(data.get('average_score', 0), 2)
+                row[category] = score
+                row['overall_score'] = max(row['overall_score'], score)
+            
+        # Round overall score
+        row['overall_score'] = round(row['overall_score'], 2)
+        rows.append(row)
+        
+    df = pd.DataFrame(rows)
+    
+    # Save to temporary CSV
+    filename = f"bulk_analysis_{job_id}.csv"
+    df.to_csv(filename, index=False)
+    
+    return FileResponse(
+        filename,
+        media_type='text/csv',
+        filename=filename
+    )
 
 if __name__ == "__main__":
     uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True) 
