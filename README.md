@@ -1,16 +1,38 @@
 # YouTube Content Compliance Analyzer
 
-A backend service that analyzes YouTube content (videos and channels) against a predefined set of compliance categories, using LLM for content assessment.
+A comprehensive FastAPI-based service that analyzes YouTube content (videos and channels) against predefined compliance categories using advanced LLM processing with concurrent pipeline architecture.
 
 ## Features
 
-- Analyze YouTube channel videos for compliance violations
-- Analyze individual YouTube videos
-- Score content from 0 to 1 against multiple compliance categories
-- Identify specific instances and evidence of violations
-- Provide detailed reports with examples and timestamps
-- Easily switch between local LLM (Mistral) and OpenAI
-- Analyze transcripts directly from CSV files (no YouTube API needed)
+- 🔍 **Channel Analysis**: Analyze entire YouTube channels with configurable video limits
+- 🎥 **Individual Video Analysis**: Analyze single YouTube videos for compliance violations
+- 📊 **Bulk Processing**: Process multiple channels concurrently with advanced queue-based pipeline
+- 🎯 **Compliance Scoring**: Score content from 0 to 1 against multiple compliance categories
+- 🔍 **Evidence Detection**: Identify specific instances and evidence of violations
+- 📈 **Detailed Reporting**: Comprehensive reports with examples, scores, and summaries
+- 🤖 **Multi-LLM Support**: Switch between local LLM (Mistral) and OpenAI
+- ⚡ **High-Performance**: Concurrent processing with 10 transcript workers and 10 LLM workers
+- 📁 **CSV Export**: Download analysis results as CSV files
+- 🚀 **Real-time Monitoring**: Live progress tracking for bulk operations
+
+## Project Structure
+
+```
+il-compliance/
+├── run_app.py                          # Main entry point
+├── src/                                # Source code directory
+│   ├── __init__.py                     # Package initialization
+│   ├── app.py                          # FastAPI application
+│   ├── youtube_analyzer.py             # YouTube data collection
+│   ├── llm_analyzer.py                 # LLM-based content analysis
+│   └── creator_processor.py            # Bulk processing pipeline
+├── data/                               # Data files
+│   └── YouTube_Controversy_Categories.csv
+├── requirements.txt                    # Python dependencies
+├── env.example                         # Environment configuration template
+├── .env                               # Your environment configuration
+└── README.md                          # This file
+```
 
 ## Setup
 
@@ -23,31 +45,37 @@ A backend service that analyzes YouTube content (videos and channels) against a 
 ### Installation
 
 1. Clone this repository:
-   ```
+   ```bash
    git clone <repository-url>
-   cd youtube-compliance-analyzer
+   cd il-compliance
    ```
 
-2. Install dependencies:
+2. Create and activate a virtual environment:
+   ```bash
+   python -m venv .venv
+   source .venv/bin/activate  # On Windows: .venv\Scripts\activate
    ```
+
+3. Install dependencies:
+   ```bash
    pip install -r requirements.txt
    ```
 
-3. Create environment file:
-   ```
+4. Create environment file:
+   ```bash
    cp env.example .env
    ```
 
-4. Edit `.env` file with your settings:
-   ```
+5. Edit `.env` file with your settings:
+   ```bash
    # LLM Settings
    LOCAL_LLM_URL=http://localhost:1234/v1
    OPENAI_API_KEY=your_openai_api_key_here
 
    # Toggle between "local" or "openai"
-   LLM_PROVIDER=local
+   LLM_PROVIDER=openai
 
-   # YouTube API (optional)
+   # YouTube API (optional, for enhanced functionality)
    YOUTUBE_API_KEY=your_youtube_api_key_here
    ```
 
@@ -55,119 +83,230 @@ A backend service that analyzes YouTube content (videos and channels) against a 
 
 ### Starting the API Server
 
-Run the FastAPI application:
+Run the application using the simple entry point:
 
-```
-python app.py
-```
-
-The API will be available at http://localhost:8000
-
-You can access the API documentation at http://localhost:8000/docs
-
-### Using the CLI Tool
-
-Analyze a YouTube channel:
-
-```
-python analyze_channel.py channel https://www.youtube.com/c/ChannelName -l 5 -p local
+```bash
+python run_app.py
 ```
 
-Analyze a single video:
+The API will be available at:
+- **API Base**: http://localhost:8000
+- **Interactive Docs**: http://localhost:8000/docs
+- **OpenAPI Schema**: http://localhost:8000/openapi.json
 
+### API Endpoints
+
+#### Core Analysis
+
+**`POST /api/analyze-creator`** - Analyze a YouTube creator's recent videos
+```json
+{
+  "creator_url": "https://www.youtube.com/@ChannelHandle",
+  "video_limit": 10,
+  "llm_provider": "openai"
+}
 ```
-python analyze_channel.py video https://www.youtube.com/watch?v=VIDEO_ID -p local
+
+**`POST /analyze/video`** - Analyze a single YouTube video
+```json
+{
+  "video_url": "https://www.youtube.com/watch?v=VIDEO_ID",
+  "llm_provider": "openai"
+}
 ```
 
-Options:
-- `-l`, `--limit`: Number of videos to analyze from a channel (default: 5)
-- `-p`, `--provider`: LLM provider: "local" (Mistral) or "openai" (default: local)
-- `-o`, `--output`: Save results to file instead of printing to console
-
-### Analyzing Transcripts from CSV
-
-If you already have transcripts or can't access them via the YouTube API, you can analyze them directly from a CSV file:
-
-1. Create a sample CSV template:
-   ```
-   python analyze_transcript_csv.py create-sample sample_transcripts.csv
-   ```
-
-2. Fill in the CSV with your transcripts and run the analysis:
-   ```
-   python analyze_transcript_csv.py analyze your_transcripts.csv -p local
-   ```
-
-The CSV file should contain the following columns:
-- `video_id`: YouTube video ID (or any unique identifier)
-- `video_title`: Title of the video
-- `transcript`: The full transcript text
-- `video_url`: (Optional) URL of the video
-
-Options:
-- `-p`, `--provider`: LLM provider: "local" (Mistral) or "openai" (default: local)
-- `-o`, `--output`: Save results to file instead of printing to console
-
-## API Endpoints
-
-### `POST /analyze/channel`
-
-Analyzes a YouTube channel.
-
-Request body:
+**`POST /analyze/channel`** - Analyze a YouTube channel (legacy)
 ```json
 {
   "channel_url": "https://www.youtube.com/c/ChannelName",
   "video_limit": 5,
-  "llm_provider": "local"
+  "llm_provider": "openai"
 }
 ```
 
-### `POST /analyze/video`
-
-Analyzes a single YouTube video.
-
-Request body:
+**`POST /api/analyze-multiple`** - Analyze multiple URLs (videos or channels)
 ```json
 {
-  "video_url": "https://www.youtube.com/watch?v=VIDEO_ID",
-  "llm_provider": "local"
+  "urls": [
+    "https://www.youtube.com/@Channel1",
+    "https://www.youtube.com/watch?v=VIDEO_ID",
+    "https://www.youtube.com/@Channel2"
+  ],
+  "llm_provider": "openai"
 }
 ```
 
-### `GET /categories`
+#### Bulk Processing
 
-Returns the list of compliance categories with definitions.
+**`POST /api/bulk-analyze`** - Upload CSV file for bulk channel analysis
+- Upload a CSV file with channel URLs
+- Returns a `job_id` for tracking progress
+- Processes channels concurrently with advanced pipeline
+
+**`GET /api/bulk-analyze/{job_id}`** - Get bulk analysis status
+```json
+{
+  "job_id": "uuid-string",
+  "status": "processing|completed|failed",
+  "total_urls": 50,
+  "processed_urls": 25,
+  "failed_urls": []
+}
+```
+
+**`GET /api/bulk-analyze/{job_id}/results`** - Get detailed results
+- Returns comprehensive analysis results
+- Includes success/failure breakdown
+- Provides detailed error categorization
+
+**`GET /api/bulk-analyze/{job_id}/csv`** - Download results as CSV
+- Downloads processed results in CSV format
+- Includes all compliance scores and metadata
+
+#### Utility
+
+**`GET /categories`** - List all compliance categories with definitions
+
+**`GET /`** - API health check
+
+**`GET /api/debug/jobs`** - Debug endpoint to list all processing jobs
+
+### Response Format
+
+All analysis endpoints return data in this format:
+
+```json
+{
+  "channel_id": "UCxxxxx",
+  "channel_name": "Channel Name",
+  "channel_handle": "@channelhandle",
+  "video_analyses": [
+    {
+      "video_id": "video123",
+      "video_title": "Video Title",
+      "video_url": "https://youtube.com/watch?v=video123",
+      "analysis": {
+        "video_id": "video123",
+        "results": {
+          "Category Name": {
+            "score": 0.75,
+            "justification": "Reason for score",
+            "evidence": ["Quote from transcript"]
+          }
+        }
+      }
+    }
+  ],
+  "summary": {
+    "Category Name": {
+      "max_score": 0.75,
+      "average_score": 0.65,
+      "videos_with_violations": 2,
+      "total_videos": 5,
+      "examples": [...]
+    }
+  }
+}
+```
 
 ## Compliance Categories
 
-The tool analyzes content against categories defined in `YouTube_Controversy_Categories.csv`, including:
+The system analyzes content against categories defined in `data/YouTube_Controversy_Categories.csv`:
 
 - Controversy or Cancelled Creators
 - Inflammatory mentions of politics, religion, and social issues
-- Military conflict
-- Obscenity
+- Military conflict and weapons
+- Obscenity and inappropriate content
+- Content that could lead to death/injury
+- Drug or alcohol related content
+- Adult/sexual content
 - And many more...
 
-Each category is scored from 0 to 1, where:
-- 0: No violation detected
-- 0.25-0.5: Minor or ambiguous instances
-- 0.75-1: Clear violations
+### Scoring System
 
-## Project Structure
+Each category is scored from 0 to 1:
+- **0**: No violation detected
+- **0.25-0.5**: Minor or ambiguous instances
+- **0.75-1**: Clear violations
 
-- `app.py` - FastAPI web application
-- `youtube_analyzer.py` - YouTube data collection module
-- `llm_analyzer.py` - LLM-based content analysis
-- `analyze_channel.py` - CLI tool for YouTube channels/videos
-- `analyze_transcript_csv.py` - CLI tool for analyzing transcripts from CSV files
-- `YouTube_Controversy_Categories.csv` - Compliance categories definitions
+## Advanced Features
 
-## Extending
+### Concurrent Processing Pipeline
 
-You can extend the tool by:
+The bulk analysis system uses a sophisticated queue-based pipeline:
 
-1. Adding new categories to the CSV file
-2. Implementing additional LLM providers in `llm_analyzer.py`
-3. Adding more detailed analysis functions
-4. Building a frontend UI that consumes the API 
+- **10 Transcript Workers**: Concurrent YouTube data extraction
+- **10 LLM Workers**: Parallel AI content analysis  
+- **5 Result Workers**: Efficient result aggregation
+- **Real-time Monitoring**: Queue depths and progress tracking
+- **Comprehensive Statistics**: P50/P99 timing metrics
+
+### Error Handling
+
+Detailed error categorization for failed analyses:
+- `invalid_channel`: Invalid/private URLs
+- `no_transcripts`: Channels without available transcripts
+- `llm_processing_failed`: AI analysis failures
+- `transcript_processing_error`: Technical YouTube API errors
+
+### Performance Monitoring
+
+- Real-time queue depth monitoring
+- Timing percentiles (P1, P50, P99)
+- Throughput metrics (URLs/second)
+- Comprehensive completion statistics
+
+## Development
+
+### Running with Auto-reload
+
+For development with automatic reloading:
+
+```bash
+uvicorn src.app:app --host 0.0.0.0 --port 8000 --reload
+```
+
+### Testing Individual Components
+
+Test the YouTube analyzer:
+```python
+from src.youtube_analyzer import YouTubeAnalyzer
+analyzer = YouTubeAnalyzer()
+```
+
+Test the LLM analyzer:
+```python
+from src.llm_analyzer import LLMAnalyzer
+llm = LLMAnalyzer(provider="openai")
+```
+
+## Troubleshooting
+
+### Common Issues
+
+1. **"No .env file found"**: Copy `env.example` to `.env` and configure your API keys
+2. **YouTube IP blocking**: Wait for temporary block to expire or use different network
+3. **No transcripts available**: YouTube videos must have captions/transcripts enabled
+4. **OpenAI rate limits**: Reduce concurrent workers or add delays between requests
+
+### Environment Variables
+
+Required variables in `.env`:
+```bash
+OPENAI_API_KEY=sk-...              # Required for OpenAI provider
+LOCAL_LLM_URL=http://localhost:1234/v1  # Required for local provider
+LLM_PROVIDER=openai                # Default provider
+YOUTUBE_API_KEY=...                # Optional, enhances functionality
+```
+
+## Contributing
+
+1. Fork the repository
+2. Create a feature branch
+3. Make your changes
+4. Add tests if applicable
+5. Submit a pull request
+
+## License
+
+[Your License Here] 
