@@ -18,7 +18,7 @@ A comprehensive FastAPI-based service that analyzes YouTube content (videos and 
 ## Project Structure
 
 ```
-il-compliance/
+youtube-creator-backend/
 ├── run_app.py                          # Main entry point
 ├── src/                                # Source code directory
 │   ├── __init__.py                     # Package initialization
@@ -47,7 +47,7 @@ il-compliance/
 1. Clone this repository:
    ```bash
    git clone <repository-url>
-   cd il-compliance
+   cd youtube-creator-backend
    ```
 
 2. Create and activate a virtual environment:
