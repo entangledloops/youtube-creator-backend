@@ -920,125 +920,292 @@ async def analyze_bulk(request: BulkAnalysisRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 async def process_creators_pipeline(job_id: str, urls: List[str], video_limit: int, llm_provider: str):
-    """Simple pipeline: Pull transcripts -> LLM queue -> Gather results -> Return results"""
+    """Queue-based pipeline with timing and concurrency monitoring"""
+    start_time = time.time()
+    
     try:
-        logger.info(f"Starting pipeline processing for job {job_id} with {len(urls)} URLs")
+        logger.info(f"🚀 Starting pipeline for job {job_id} with {len(urls)} URLs")
         
         # Initialize analyzers
         youtube_analyzer = YouTubeAnalyzer()
         llm_analyzer = LLMAnalyzer(provider=llm_provider)
         
-        # Process creators in small batches to avoid overwhelming APIs
-        batch_size = 3
-        successful = 0
-        failed = 0
+        # Create queues for pipeline stages
+        transcript_queue = asyncio.Queue(maxsize=1000)
+        llm_queue = asyncio.Queue(maxsize=1000)
+        result_queue = asyncio.Queue(maxsize=1000)
         
-        for i in range(0, len(urls), batch_size):
-            batch_urls = urls[i:i + batch_size]
-            logger.info(f"Processing batch {i//batch_size + 1}: {len(batch_urls)} URLs")
-            
-            # Process batch concurrently
-            tasks = []
-            for url in batch_urls:
-                task = process_single_creator(url, video_limit, youtube_analyzer, llm_analyzer, job_id)
-                tasks.append(task)
-            
-            # Wait for batch to complete
-            batch_results = await asyncio.gather(*tasks, return_exceptions=True)
-            
-            # Count results
-            for result in batch_results:
-                if isinstance(result, Exception):
-                    failed += 1
-                    logger.error(f"Batch processing error: {result}")
-                elif result and result.get("status") == "success":
-                    successful += 1
-                else:
-                    failed += 1
-            
-            # Small delay between batches to avoid rate limits
-            if i + batch_size < len(urls):
-                await asyncio.sleep(2)
+        # Timing tracking
+        timing_stats = {
+            'transcript_times': [],
+            'llm_times': [],
+            'total_times': []
+        }
+        
+        # Start all URLs processing immediately (true concurrency)
+        logger.info(f"📋 Queuing all {len(urls)} URLs for processing")
+        for url in urls:
+            await transcript_queue.put({
+                'url': url,
+                'video_limit': video_limit,
+                'start_time': time.time()
+            })
+        
+        # Start workers
+        transcript_workers = []
+        llm_workers = []
+        result_workers = []
+        
+        # 20 transcript workers as requested
+        for i in range(20):
+            worker = asyncio.create_task(
+                transcript_worker(i, transcript_queue, llm_queue, youtube_analyzer, timing_stats, job_id)
+            )
+            transcript_workers.append(worker)
+        
+        # 10 LLM workers 
+        for i in range(10):
+            worker = asyncio.create_task(
+                llm_worker(i, llm_queue, result_queue, llm_analyzer, timing_stats, job_id)
+            )
+            llm_workers.append(worker)
+        
+        # 5 result workers
+        for i in range(5):
+            worker = asyncio.create_task(
+                result_worker(i, result_queue, timing_stats, job_id)
+            )
+            result_workers.append(worker)
+        
+        # Monitor progress and queue depths
+        monitor_task = asyncio.create_task(
+            monitor_pipeline(job_id, transcript_queue, llm_queue, result_queue, len(urls))
+        )
+        
+        # Wait for all work to complete
+        logger.info("⏳ Waiting for all transcript work to complete...")
+        await transcript_queue.join()
+        
+        logger.info("⏳ Waiting for all LLM work to complete...")
+        await llm_queue.join()
+        
+        logger.info("⏳ Waiting for all result work to complete...")
+        await result_queue.join()
+        
+        # Cancel workers
+        for workers in [transcript_workers, llm_workers, result_workers]:
+            for worker in workers:
+                worker.cancel()
+        monitor_task.cancel()
+        
+        # Calculate final statistics
+        total_time = time.time() - start_time
+        successful = len(analysis_results[job_id]['results'])
+        failed = len(analysis_results[job_id]['failed_urls'])
+        total_processed = successful + failed
+        
+        # Log comprehensive final statistics
+        logger.info("=" * 80)
+        logger.info(f"🏁 FINAL STATISTICS for job {job_id}")
+        logger.info(f"📊 URLs submitted: {len(urls)}")
+        logger.info(f"📊 URLs processed: {total_processed}")
+        logger.info(f"✅ Successful: {successful}")
+        logger.info(f"❌ Failed: {failed}")
+        logger.info(f"⏱️  Total time: {total_time:.2f}s")
+        logger.info(f"🚀 Throughput: {total_processed/total_time:.2f} URLs/sec")
+        
+        # Timing percentiles
+        if timing_stats['transcript_times']:
+            transcript_times = sorted(timing_stats['transcript_times'])
+            logger.info(f"📈 Transcript times - P50: {transcript_times[len(transcript_times)//2]:.2f}s, P99: {transcript_times[int(len(transcript_times)*0.99)]:.2f}s")
+        
+        if timing_stats['llm_times']:
+            llm_times = sorted(timing_stats['llm_times'])
+            logger.info(f"📈 LLM times - P50: {llm_times[len(llm_times)//2]:.2f}s, P99: {llm_times[int(len(llm_times)*0.99)]:.2f}s")
+        
+        # Log any discrepancies
+        if total_processed != len(urls):
+            logger.error(f"🚨 DISCREPANCY: Expected {len(urls)} URLs, processed {total_processed}")
+            logger.error(f"🚨 Missing: {len(urls) - total_processed} URLs")
+        
+        logger.info("=" * 80)
         
         # Mark job as complete
-        total_processed = successful + failed
         analysis_results[job_id]['status'] = 'completed'
         analysis_results[job_id]['completed_at'] = datetime.now().isoformat()
         analysis_results[job_id]['processed_urls'] = total_processed
         
-        logger.info(f"Pipeline completed for job {job_id}: {successful} successful, {failed} failed")
-        
     except Exception as e:
-        logger.error(f"Error in pipeline processing: {str(e)}")
+        logger.error(f"💥 Error in pipeline processing: {str(e)}")
         if job_id in analysis_results:
             analysis_results[job_id]['status'] = 'failed'
             analysis_results[job_id]['error'] = str(e)
             analysis_results[job_id]['completed_at'] = datetime.now().isoformat()
 
-async def process_single_creator(url: str, video_limit: int, youtube_analyzer, llm_analyzer, job_id: str):
-    """Process a single creator through the pipeline: transcripts -> LLM -> results"""
-    try:
-        logger.info(f"Step 1: Getting channel data for {url}")
-        
-        # Step 1: Pull transcripts
-        channel_data = await youtube_analyzer.analyze_channel_async(
-            url, 
-            video_limit=video_limit,
-            use_concurrent=True
-        )
-        
-        if not channel_data or not channel_data.get('videos'):
-            logger.warning(f"No channel data or videos found for {url}")
-            analysis_results[job_id]['failed_urls'].append({
-                'url': url,
-                'error': 'No channel data or videos with transcripts found'
-            })
-            return {"status": "failed", "url": url}
-        
-        logger.info(f"Step 2: Sending {len(channel_data['videos'])} videos to LLM for {url}")
-        
-        # Step 2: LLM queue - send to OpenAI for analysis
-        analysis_result = await llm_analyzer.analyze_channel_content_async(channel_data)
-        
-        logger.info(f"Step 3: Got LLM results for {url}")
-        
-        # Step 3: Gather results and format properly
-        channel_name = channel_data.get('channel_name', '')
-        channel_handle = channel_data.get('channel_handle', '')
-        
-        # Clean channel name/handle
-        if isinstance(channel_name, str):
-            channel_name = channel_name.replace('@', '')
-        if isinstance(channel_handle, str):
-            channel_handle = channel_handle.replace('@', '')
+async def transcript_worker(worker_id: int, transcript_queue: asyncio.Queue, llm_queue: asyncio.Queue, 
+                           youtube_analyzer, timing_stats: dict, job_id: str):
+    """Worker that pulls transcripts and feeds LLM queue"""
+    while True:
+        try:
+            # Get work item
+            item = await transcript_queue.get()
+            url = item['url']
+            video_limit = item['video_limit']
+            start_time = time.time()
             
-        if not channel_name and channel_data.get('channel_id'):
-            channel_name = f"Channel {channel_data['channel_id']}"
-        
-        # Step 4: Return results - store in job results
-        final_result = {
-            "url": url,
-            "channel_id": channel_data.get('channel_id', "unknown"),
-            "channel_name": channel_name or "Unknown",
-            "channel_handle": channel_handle or "Unknown", 
-            "video_analyses": analysis_result.get('video_analyses', []),
-            "summary": analysis_result.get('summary', {}),
-            "status": "success"
-        }
-        
-        # Store result
-        analysis_results[job_id]['results'][url] = final_result
-        logger.info(f"Step 4: Stored results for {url}")
-        
-        return final_result
-        
-    except Exception as e:
-        logger.error(f"Error processing creator {url}: {str(e)}")
-        analysis_results[job_id]['failed_urls'].append({
-            'url': url,
-            'error': str(e)
-        })
-        return {"status": "failed", "url": url, "error": str(e)}
+            logger.info(f"🎬 Worker {worker_id}: Getting transcripts for {url}")
+            
+            # Pull transcripts
+            channel_data = await youtube_analyzer.analyze_channel_async(
+                url, 
+                video_limit=video_limit,
+                use_concurrent=True
+            )
+            
+            transcript_time = time.time() - start_time
+            timing_stats['transcript_times'].append(transcript_time)
+            
+            if not channel_data or not channel_data.get('videos'):
+                logger.warning(f"❌ Worker {worker_id}: No data for {url}")
+                analysis_results[job_id]['failed_urls'].append({
+                    'url': url,
+                    'error': 'No channel data or videos with transcripts found'
+                })
+            else:
+                logger.info(f"✅ Worker {worker_id}: Got {len(channel_data['videos'])} videos for {url} in {transcript_time:.2f}s")
+                # Pass to LLM queue
+                await llm_queue.put({
+                    'url': url,
+                    'channel_data': channel_data,
+                    'start_time': time.time()
+                })
+            
+            transcript_queue.task_done()
+            
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"💥 Transcript worker {worker_id} error: {e}")
+            transcript_queue.task_done()
+
+async def llm_worker(worker_id: int, llm_queue: asyncio.Queue, result_queue: asyncio.Queue,
+                     llm_analyzer, timing_stats: dict, job_id: str):
+    """Worker that processes transcripts through LLM"""
+    while True:
+        try:
+            # Get work item
+            item = await llm_queue.get()
+            url = item['url']
+            channel_data = item['channel_data']
+            start_time = time.time()
+            
+            logger.info(f"🤖 LLM Worker {worker_id}: Processing {url}")
+            
+            # Send to LLM
+            analysis_result = await llm_analyzer.analyze_channel_content_async(channel_data)
+            
+            llm_time = time.time() - start_time
+            timing_stats['llm_times'].append(llm_time)
+            
+            logger.info(f"✅ LLM Worker {worker_id}: Completed {url} in {llm_time:.2f}s")
+            
+            # Pass to result queue
+            await result_queue.put({
+                'url': url,
+                'channel_data': channel_data,
+                'analysis_result': analysis_result,
+                'start_time': time.time()
+            })
+            
+            llm_queue.task_done()
+            
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"💥 LLM worker {worker_id} error processing {item.get('url', 'unknown')}: {e}")
+            # Add to failed URLs
+            analysis_results[job_id]['failed_urls'].append({
+                'url': item.get('url', 'unknown'),
+                'error': str(e)
+            })
+            llm_queue.task_done()
+
+async def result_worker(worker_id: int, result_queue: asyncio.Queue, timing_stats: dict, job_id: str):
+    """Worker that processes final results and stores them"""
+    while True:
+        try:
+            # Get work item
+            item = await result_queue.get()
+            url = item['url']
+            channel_data = item['channel_data']
+            analysis_result = item['analysis_result']
+            start_time = time.time()
+            
+            logger.info(f"📝 Result Worker {worker_id}: Storing {url}")
+            
+            # Format results
+            channel_name = channel_data.get('channel_name', '')
+            channel_handle = channel_data.get('channel_handle', '')
+            
+            # Clean channel name/handle
+            if isinstance(channel_name, str):
+                channel_name = channel_name.replace('@', '')
+            if isinstance(channel_handle, str):
+                channel_handle = channel_handle.replace('@', '')
+                
+            if not channel_name and channel_data.get('channel_id'):
+                channel_name = f"Channel {channel_data['channel_id']}"
+            
+            # Store final result
+            final_result = {
+                "url": url,
+                "channel_id": channel_data.get('channel_id', "unknown"),
+                "channel_name": channel_name or "Unknown",
+                "channel_handle": channel_handle or "Unknown", 
+                "video_analyses": analysis_result.get('video_analyses', []),
+                "summary": analysis_result.get('summary', {}),
+                "status": "success"
+            }
+            
+            analysis_results[job_id]['results'][url] = final_result
+            
+            result_time = time.time() - start_time
+            logger.info(f"✅ Result Worker {worker_id}: Stored {url} in {result_time:.3f}s")
+            
+            result_queue.task_done()
+            
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"💥 Result worker {worker_id} error: {e}")
+            result_queue.task_done()
+
+async def monitor_pipeline(job_id: str, transcript_queue: asyncio.Queue, llm_queue: asyncio.Queue, 
+                          result_queue: asyncio.Queue, total_urls: int):
+    """Monitor queue depths and progress"""
+    while True:
+        try:
+            await asyncio.sleep(5)  # Monitor every 5 seconds
+            
+            transcript_size = transcript_queue.qsize()
+            llm_size = llm_queue.qsize() 
+            result_size = result_queue.qsize()
+            
+            completed = len(analysis_results[job_id]['results'])
+            failed = len(analysis_results[job_id]['failed_urls'])
+            processed = completed + failed
+            
+            logger.info(f"📊 PIPELINE STATUS - Queues: T:{transcript_size} | L:{llm_size} | R:{result_size} | Progress: {processed}/{total_urls} ({processed/total_urls*100:.1f}%)")
+            
+            # If all work is done, break
+            if processed >= total_urls and transcript_size == 0 and llm_size == 0 and result_size == 0:
+                logger.info("🏁 All work completed, stopping monitor")
+                break
+                
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"💥 Monitor error: {e}")
 
 @app.get("/api/debug/jobs")
 async def get_all_jobs():
