@@ -557,7 +557,7 @@ async def get_categories():
     """
     try:
         import pandas as pd
-        categories_df = pd.read_csv("YouTube_Controversy_Categories.csv")
+        categories_df = pd.read_csv("../data/YouTube_Controversy_Categories.csv")
         categories = categories_df.to_dict(orient="records")
         return {"categories": categories}
     except Exception as e:
@@ -867,7 +867,7 @@ async def download_bulk_analysis_csv(job_id: str):
         raise HTTPException(status_code=400, detail="Analysis still in progress")
         
     # Get all categories
-    categories_df = pd.read_csv("YouTube_Controversy_Categories.csv")
+    categories_df = pd.read_csv("../data/YouTube_Controversy_Categories.csv")
     all_categories = categories_df['Category'].tolist()
         
     # Convert results to DataFrame
@@ -1288,5 +1288,4 @@ async def get_all_jobs():
         }
     }
 
-if __name__ == "__main__":
-    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
+# Entry point moved to ../run_app.py

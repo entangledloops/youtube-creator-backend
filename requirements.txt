@@ -1,0 +1,12 @@
+youtube-transcript-api
+python-dotenv
+fastapi
+uvicorn
+requests
+beautifulsoup4
+pydantic
+httpx
+pandas
+python-multipart
+aiohttp
+pytube

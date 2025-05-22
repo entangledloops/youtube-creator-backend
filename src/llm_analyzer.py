@@ -15,7 +15,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class LLMAnalyzer:
-    def __init__(self, provider="local", categories_file="YouTube_Controversy_Categories.csv"):
+    def __init__(self, provider="local", categories_file="../data/YouTube_Controversy_Categories.csv"):
         """
         Initialize LLM analyzer with specified provider
         
