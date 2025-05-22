@@ -14,7 +14,7 @@ import statistics
 # Get the logger for this module
 logger = logging.getLogger('creator_processor')
 
-# Configure logging to output to both file and console
+# Configure logging to output to console only
 # Clear any existing handlers to avoid duplicates
 for handler in logger.handlers[:]:
     logger.removeHandler(handler)
@@ -25,15 +25,8 @@ console_handler.setLevel(logging.INFO)
 console_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 console_handler.setFormatter(console_formatter)
 
-# Create file handler with 'w' mode to start with a fresh log file each run
-file_handler = logging.FileHandler('creator_processor.log', mode='w')
-file_handler.setLevel(logging.INFO)
-file_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-file_handler.setFormatter(file_formatter)
-
-# Add handlers to logger and ensure proper configuration
+# Add handler to logger and ensure proper configuration
 logger.addHandler(console_handler)
-logger.addHandler(file_handler)
 logger.setLevel(logging.INFO)
 logger.propagate = False  # Prevent duplicate logs from propagating to root logger
 
@@ -237,10 +230,6 @@ class CreatorProcessor:
                 f.write("\n" + "="*50 + "\n")
             
             logger.info(f"Stats file '{filename}' written successfully")
-            
-            # Force flush all handlers
-            for handler in logger.handlers:
-                handler.flush()
                 
         except Exception as e:
             error_msg = f"CRITICAL ERROR logging completion stats: {str(e)}"
@@ -424,9 +413,7 @@ class CreatorProcessor:
         logger.info("Starting bulk processing with enhanced concurrency...")
         self.start_time = time.time()
         
-        # Force console logging to be visible immediately
-        for handler in logger.handlers:
-            handler.flush()
+        # Console logging will be visible immediately
         
         # Handle duplicate URLs
         unique_urls = []
@@ -505,16 +492,9 @@ class CreatorProcessor:
             try:
                 self._log_completion_stats(results)
                 logger.info("Completion statistics logged successfully.")
-                
-                # Force flush logs again
-                for handler in logger.handlers:
-                    handler.flush()
                     
             except Exception as e:
                 logger.error(f"Failed to log completion statistics: {str(e)}", exc_info=True)
-                # Force flush again
-                for handler in logger.handlers:
-                    handler.flush()
             
             return results
             
