@@ -309,7 +309,7 @@ INSTRUCTIONS:
             return {"error": str(e)}
     
     async def _query_openai_async(self, prompt: str, video_id: str) -> Dict[str, Any]:
-        """Query OpenAI API (asynchronous version)"""
+        """Query OpenAI API (asynchronous version) with retry logic"""
         url = f"{self.api_base_url}/chat/completions"
         
         headers = {
@@ -333,42 +333,58 @@ INSTRUCTIONS:
             "max_tokens": 1000  # Limit response size
         }
         
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, headers=headers, json=payload) as response:
-                    if response.status == 401:
-                        logger.error(f"OpenAI API unauthorized. Response: {await response.text()}")
-                        # Log the actual request headers that were sent
-                        logger.error(f"Request headers sent: {dict(response.request_info.headers)}")
-                    elif response.status == 400:
-                        logger.error(f"OpenAI API bad request. Response: {await response.text()}")
-                        logger.error(f"Request payload: {json.dumps(payload, indent=2)}")
-                    response.raise_for_status()
-                    
-                    result = await response.json()
-                    content = result.get("choices", [{}])[0].get("message", {}).get("content", "{}")
-                    
-                    # Try to extract valid JSON
-                    try:
-                        # Extract valid JSON
-                        analysis_results = self._extract_valid_json(content)
+        max_retries = 3
+        base_delay = 1  # Start with 1 second delay
+        
+        for attempt in range(max_retries):
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(url, headers=headers, json=payload) as response:
+                        if response.status == 429:  # Rate limit error
+                            if attempt < max_retries - 1:  # Don't sleep on last attempt
+                                delay = base_delay * (2 ** attempt)  # Exponential backoff
+                                logger.warning(f"Rate limit hit, retrying in {delay} seconds...")
+                                await asyncio.sleep(delay)
+                                continue
+                        elif response.status == 401:
+                            logger.error(f"OpenAI API unauthorized. Response: {await response.text()}")
+                            logger.error(f"Request headers sent: {dict(response.request_info.headers)}")
+                        elif response.status == 400:
+                            logger.error(f"OpenAI API bad request. Response: {await response.text()}")
+                            logger.error(f"Request payload: {json.dumps(payload, indent=2)}")
                         
-                        # Filter out categories with score=0
-                        analysis_results = {
-                            category: data for category, data in analysis_results.items()
-                            if data.get('score', 0) > 0
-                        }
+                        response.raise_for_status()
                         
-                        return {
-                            "video_id": video_id,
-                            "results": analysis_results
-                        }
-                    except Exception as e:
-                        logger.error(f"Error processing OpenAI response: {str(e)}")
-                        return {"error": str(e)}
-        except Exception as e:
-            logger.error(f"Error querying OpenAI: {str(e)}")
-            return {"error": str(e)}
+                        result = await response.json()
+                        content = result.get("choices", [{}])[0].get("message", {}).get("content", "{}")
+                        
+                        # Try to extract valid JSON
+                        try:
+                            # Extract valid JSON
+                            analysis_results = self._extract_valid_json(content)
+                            
+                            # Filter out categories with score=0
+                            analysis_results = {
+                                category: data for category, data in analysis_results.items()
+                                if data.get('score', 0) > 0
+                            }
+                            
+                            return {
+                                "video_id": video_id,
+                                "results": analysis_results
+                            }
+                        except Exception as e:
+                            logger.error(f"Error processing OpenAI response: {str(e)}")
+                            return {"error": str(e)}
+            except Exception as e:
+                if attempt == max_retries - 1:  # Last attempt
+                    logger.error(f"Error querying OpenAI after {max_retries} attempts: {str(e)}")
+                    return {"error": str(e)}
+                delay = base_delay * (2 ** attempt)
+                logger.warning(f"Error querying OpenAI, retrying in {delay} seconds: {str(e)}")
+                await asyncio.sleep(delay)
+        
+        return {"error": "Max retries exceeded"}
     
     def analyze_channel_content(self, channel_data):
         """Analyze content from multiple videos in a channel"""

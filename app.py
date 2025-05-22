@@ -18,6 +18,7 @@ import json
 
 from youtube_analyzer import YouTubeAnalyzer
 from llm_analyzer import LLMAnalyzer
+from creator_processor import CreatorProcessor, ProcessingConfig
 
 # Configure logging
 logging.basicConfig(
@@ -101,6 +102,9 @@ class AnalysisResponse(BaseModel):
     channel_handle: str
     video_analyses: List[dict]
     summary: dict
+
+class BulkAnalysisResponse(BaseModel):
+    results: List[Dict[str, Any]]
 
 # Initialize analyzers
 youtube_api_key = os.getenv("YOUTUBE_API_KEY")
@@ -828,6 +832,39 @@ async def download_bulk_analysis_csv(job_id: str):
         media_type='text/csv',
         filename=filename
     )
+
+@app.post("/api/analyze-bulk", response_model=BulkAnalysisResponse)
+async def analyze_bulk(request: BulkAnalysisRequest, background_tasks: BackgroundTasks):
+    """
+    Analyze multiple YouTube creators' recent videos for content compliance
+    """
+    try:
+        # Initialize analyzers
+        youtube_analyzer = YouTubeAnalyzer()
+        llm_analyzer = LLMAnalyzer(provider=request.llm_provider)
+        
+        # Create processor with configuration
+        config = ProcessingConfig(
+            max_concurrent_transcripts=10,  # Adjust based on your needs
+            max_concurrent_llm=5,  # Adjust based on your needs
+            batch_size=3,  # Process 3 creators at a time
+            batch_delay=1.0  # 1 second delay between batches
+        )
+        processor = CreatorProcessor(youtube_analyzer, llm_analyzer, config)
+        
+        # Convert HttpUrl objects to strings
+        urls = [str(url).strip() for url in request.urls]
+        
+        # Process creators through the pipeline
+        results = await processor.process_creators(urls, request.video_limit)
+        
+        return {
+            "results": results
+        }
+        
+    except Exception as e:
+        logger.error(f"Error in bulk analysis: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True) 
