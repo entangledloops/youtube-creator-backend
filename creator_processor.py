@@ -15,24 +15,32 @@ import statistics
 logger = logging.getLogger('creator_processor')
 
 # Configure logging to output to both file and console
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler('creator_processor.log')
-    ]
-)
+# Clear any existing handlers to avoid duplicates
+for handler in logger.handlers[:]:
+    logger.removeHandler(handler)
+
+# Create console handler that will always output to stdout
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setLevel(logging.INFO)
+console_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+console_handler.setFormatter(console_formatter)
+
+# Create file handler with 'w' mode to start with a fresh log file each run
+file_handler = logging.FileHandler('creator_processor.log', mode='w')
+file_handler.setLevel(logging.INFO)
+file_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+file_handler.setFormatter(file_formatter)
+
+# Add handlers to logger and ensure proper configuration
+logger.addHandler(console_handler)
+logger.addHandler(file_handler)
 logger.setLevel(logging.INFO)
-if not logger.handlers:
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
-    logger.addHandler(handler)
+logger.propagate = False  # Prevent duplicate logs from propagating to root logger
 
 @dataclass
 class ProcessingConfig:
     """Configuration for creator processing"""
-    max_concurrent_transcripts: int = 50
+    max_concurrent_transcripts: int = 20
     max_concurrent_llm: int = 20
     batch_size: int = 10
     batch_delay: float = 0.0
@@ -66,6 +74,14 @@ class CreatorProcessor:
             'llm_analysis': [],
             'total_processing': []
         }
+        
+        # Queue size metrics
+        self.queue_metrics = {
+            'transcript_queue': [],
+            'llm_queue': [],
+            'result_queue': []
+        }
+        
         self.start_time = None
         
         # Processing state
@@ -87,15 +103,37 @@ class CreatorProcessor:
             'p99': statistics.quantiles(times, n=100)[98]
         }
         
+    async def _track_queue_sizes(self):
+        """Track queue sizes periodically"""
+        while not self.processing_complete.is_set():
+            self.queue_metrics['transcript_queue'].append(self.transcript_queue.qsize())
+            self.queue_metrics['llm_queue'].append(self.llm_queue.qsize())
+            self.queue_metrics['result_queue'].append(self.result_queue.qsize())
+            await asyncio.sleep(1)  # Sample every second
+    
     def _log_completion_stats(self, results: List[Dict[str, Any]]) -> None:
         """Log completion statistics"""
+        logger.info("=== STARTING COMPLETION STATS GENERATION ===")
+        
         try:
             total_time = time.time() - self.start_time
+            logger.info(f"Total processing time: {total_time:.2f} seconds")
+            
+            # Calculate timing stats
             timing_stats = {
                 'channel_fetch': self._calculate_percentiles(self.timing_metrics['channel_fetch']),
                 'transcript_fetch': self._calculate_percentiles(self.timing_metrics['transcript_fetch']),
                 'llm_analysis': self._calculate_percentiles(self.timing_metrics['llm_analysis'])
             }
+            logger.info(f"Timing metrics calculated: {len(self.timing_metrics['channel_fetch'])} channel fetches, {len(self.timing_metrics['transcript_fetch'])} transcript fetches, {len(self.timing_metrics['llm_analysis'])} LLM analyses")
+            
+            # Calculate queue size statistics
+            queue_stats = {
+                'transcript_queue': self._calculate_percentiles(self.queue_metrics['transcript_queue']),
+                'llm_queue': self._calculate_percentiles(self.queue_metrics['llm_queue']),
+                'result_queue': self._calculate_percentiles(self.queue_metrics['result_queue'])
+            }
+            logger.info(f"Queue metrics calculated for {len(self.queue_metrics['transcript_queue'])} samples")
             
             # Calculate statistics
             total_creators = len(results)
@@ -110,21 +148,34 @@ class CreatorProcessor:
             )
             videos_without_transcripts = total_videos - videos_with_transcripts
             
+            logger.info(f"Calculated stats: {total_creators} creators, {successful_creators} successful, {total_videos} videos")
+            
             # Group errors by type
             error_types = {}
             for url, error in self.errors.items():
                 error_type = error.split(':')[0] if ':' in error else error
                 error_types[error_type] = error_types.get(error_type, 0) + 1
             
-            # Log completion statistics
-            logger.info("\n=== Bulk Processing Complete ===")
+            # Create and log stats
+            logger.info("\n" + "="*50)
+            logger.info("BULK PROCESSING COMPLETE")
+            logger.info("="*50)
             logger.info(f"Total processing time: {total_time:.2f} seconds")
+            
             logger.info(f"\nTiming Statistics (seconds):")
-            for operation, stats in timing_stats.items():
-                logger.info(f"\n{operation.replace('_', ' ').title()}:")
-                logger.info(f"  P1:  {stats['p1']:.2f}")
-                logger.info(f"  P50: {stats['p50']:.2f}")
-                logger.info(f"  P99: {stats['p99']:.2f}")
+            for operation, op_stats in timing_stats.items():
+                logger.info(f"{operation.replace('_', ' ').title()}:")
+                logger.info(f"  P1:  {op_stats['p1']:.2f}")
+                logger.info(f"  P50: {op_stats['p50']:.2f}")
+                logger.info(f"  P99: {op_stats['p99']:.2f}")
+            
+            logger.info(f"\nQueue Size Statistics (items):")
+            for queue_name, q_stats in queue_stats.items():
+                logger.info(f"{queue_name.replace('_', ' ').title()}:")
+                logger.info(f"  P1:  {q_stats['p1']:.0f}")
+                logger.info(f"  P50: {q_stats['p50']:.0f}")
+                logger.info(f"  P99: {q_stats['p99']:.0f}")
+                logger.info(f"  Max: {max(self.queue_metrics[queue_name]):.0f}")
             
             logger.info(f"\nCreator Statistics:")
             logger.info(f"  Total creators processed: {total_creators}")
@@ -141,14 +192,74 @@ class CreatorProcessor:
                 for error_type, count in error_types.items():
                     logger.info(f"  - {error_type}: {count} occurrences")
             
-            logger.info("\n=============================\n")
+            logger.info("="*50)
             
-            # Force flush the logs
+            # Write to file
+            timestamp = time.strftime("%Y%m%d-%H%M%S")
+            filename = f"processing_stats_{timestamp}.txt"
+            logger.info(f"Writing detailed stats to file: {filename}")
+            
+            with open(filename, 'w') as f:
+                f.write("BULK PROCESSING COMPLETE\n")
+                f.write("="*50 + "\n")
+                f.write(f"Total processing time: {total_time:.2f} seconds\n\n")
+                
+                f.write("Timing Statistics (seconds):\n")
+                for operation, op_stats in timing_stats.items():
+                    f.write(f"\n{operation.replace('_', ' ').title()}:\n")
+                    f.write(f"  P1:  {op_stats['p1']:.2f}\n")
+                    f.write(f"  P50: {op_stats['p50']:.2f}\n")
+                    f.write(f"  P99: {op_stats['p99']:.2f}\n")
+                
+                f.write(f"\nQueue Size Statistics (items):\n")
+                for queue_name, q_stats in queue_stats.items():
+                    f.write(f"\n{queue_name.replace('_', ' ').title()}:\n")
+                    f.write(f"  P1:  {q_stats['p1']:.0f}\n")
+                    f.write(f"  P50: {q_stats['p50']:.0f}\n")
+                    f.write(f"  P99: {q_stats['p99']:.0f}\n")
+                    f.write(f"  Max: {max(self.queue_metrics[queue_name]):.0f}\n")
+                
+                f.write(f"\nCreator Statistics:\n")
+                f.write(f"  Total creators processed: {total_creators}\n")
+                f.write(f"  Successful creators: {successful_creators}\n")
+                f.write(f"  Failed creators: {failed_creators}\n")
+                
+                f.write(f"\nVideo Statistics:\n")
+                f.write(f"  Total videos found: {total_videos}\n")
+                f.write(f"  Videos with transcripts: {videos_with_transcripts}\n")
+                f.write(f"  Videos without transcripts: {videos_without_transcripts}\n")
+                
+                if error_types:
+                    f.write(f"\nError Breakdown:\n")
+                    for error_type, count in error_types.items():
+                        f.write(f"  - {error_type}: {count} occurrences\n")
+                
+                f.write("\n" + "="*50 + "\n")
+            
+            logger.info(f"Stats file '{filename}' written successfully")
+            
+            # Force flush all handlers
             for handler in logger.handlers:
                 handler.flush()
                 
         except Exception as e:
-            logger.error(f"Error logging completion stats: {str(e)}", exc_info=True)
+            error_msg = f"CRITICAL ERROR logging completion stats: {str(e)}"
+            logger.error(error_msg, exc_info=True)
+            
+            # Emergency write to file
+            try:
+                with open("processing_stats_EMERGENCY.txt", 'w') as f:
+                    f.write(f"ERROR: {error_msg}\n")
+                    f.write(f"Results count: {len(results) if results else 'None'}\n")
+                    f.write(f"Total creators: {self.total_creators}\n")
+                    f.write(f"Processed creators: {self.processed_creators}\n")
+                    f.write(f"Exception details: {str(e)}\n")
+                logger.error("Emergency stats file written")
+            except Exception as e2:
+                logger.error(f"Could not even write emergency file: {str(e2)}")
+            
+            # Re-raise to ensure caller knows it failed
+            raise
         
     async def _fetch_channel_data(self, url: str, video_limit: int) -> Dict[str, Any]:
         """Fetch channel data and queue videos for processing"""
@@ -309,9 +420,13 @@ class CreatorProcessor:
                 self.result_queue.task_done()
     
     async def process_creators(self, urls: List[str], video_limit: int) -> List[Dict[str, Any]]:
-        """Process multiple creators through the pipeline"""
-        logger.info("Starting bulk processing...")
+        """Process multiple creators through the pipeline with optimized concurrency"""
+        logger.info("Starting bulk processing with enhanced concurrency...")
         self.start_time = time.time()
+        
+        # Force console logging to be visible immediately
+        for handler in logger.handlers:
+            handler.flush()
         
         # Handle duplicate URLs
         unique_urls = []
@@ -330,27 +445,38 @@ class CreatorProcessor:
         self.processed_videos = 0
         self.processing_complete.clear()
         
-        # Start worker tasks
+        # Start worker tasks with higher concurrency
+        num_transcript_workers = min(self.config.max_concurrent_transcripts, 50)
+        num_llm_workers = min(self.config.max_concurrent_llm, 30)
+        
+        logger.info(f"Creating {num_transcript_workers} transcript workers and {num_llm_workers} LLM workers")
+        
         transcript_workers = [
             asyncio.create_task(self._process_transcripts())
-            for _ in range(self.config.max_concurrent_transcripts)
+            for _ in range(num_transcript_workers)
         ]
         llm_workers = [
             asyncio.create_task(self._process_llm())
-            for _ in range(self.config.max_concurrent_llm)
+            for _ in range(num_llm_workers)
         ]
         result_worker = asyncio.create_task(self._process_results())
         
+        # Start queue size tracking
+        queue_tracker = asyncio.create_task(self._track_queue_sizes())
+        
         try:
-            # Start fetching channel data for all creators immediately
+            # Start fetching channel data for all creators immediately in parallel
             channel_tasks = []
             for url in unique_urls:
                 task = asyncio.create_task(self._fetch_channel_data(url, video_limit))
                 channel_tasks.append(task)
             
+            # Show progress during fetch
+            logger.info(f"Fetching {len(channel_tasks)} channel data sets concurrently...")
+            
             # Wait for all channel data to be fetched
             await asyncio.gather(*channel_tasks)
-            logger.info("All channel data fetched, waiting for processing to complete...")
+            logger.info("All channel data fetched, processing videos concurrently...")
             
             # Wait for all results to be processed
             await self.processing_complete.wait()
@@ -375,15 +501,26 @@ class CreatorProcessor:
                     })
             
             # Log completion statistics
-            logger.info("Logging completion statistics...")
-            self._log_completion_stats(results)
-            logger.info("Completion statistics logged.")
+            logger.info("About to log completion statistics...")
+            try:
+                self._log_completion_stats(results)
+                logger.info("Completion statistics logged successfully.")
+                
+                # Force flush logs again
+                for handler in logger.handlers:
+                    handler.flush()
+                    
+            except Exception as e:
+                logger.error(f"Failed to log completion statistics: {str(e)}", exc_info=True)
+                # Force flush again
+                for handler in logger.handlers:
+                    handler.flush()
             
             return results
             
         finally:
             # Clean up worker tasks
-            for worker in transcript_workers + llm_workers + [result_worker]:
+            for worker in transcript_workers + llm_workers + [result_worker, queue_tracker]:
                 worker.cancel()
             logger.info("Worker tasks cleaned up.")
     

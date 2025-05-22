@@ -5,7 +5,7 @@ import os
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, UploadFile, File, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, HttpUrl
 from typing import Optional, List, Dict, Any
 import logging
@@ -15,6 +15,7 @@ import pandas as pd
 import uuid
 from datetime import datetime
 import json
+import time
 
 from youtube_analyzer import YouTubeAnalyzer
 from llm_analyzer import LLMAnalyzer
@@ -331,7 +332,7 @@ async def analyze_creator(request: CreatorAnalysisRequest):
                 "summary": {},
                 "status": "failed"
             }
-            
+        
         # Analyze content against compliance categories using async processing
         analysis_results = await llm_analyzer.analyze_channel_content_async(channel_data)
         
@@ -696,11 +697,11 @@ async def process_bulk_analysis(urls: List[str], video_limit: int, llm_provider:
 @app.post("/api/bulk-analyze")
 async def bulk_analyze(
     file: UploadFile = File(...),
-    request: BulkAnalysisRequest = None,
-    background_tasks: BackgroundTasks = None
+    request: BulkAnalysisRequest = None
 ):
     """Bulk analyze multiple YouTube creators from a CSV file.
     The file can be a single column of URLs with or without a header.
+    Uses direct concurrency instead of background tasks.
     """
     try:
         # Read CSV file with flexible header handling
@@ -742,14 +743,20 @@ async def bulk_analyze(
             'failed_urls': []
         }
         
-        # Start processing in background
-        background_tasks.add_task(
-            process_bulk_analysis,
-            cleaned_urls,
-            request.video_limit if request else 10,
-            request.llm_provider if request else "openai",
-            job_id
+        logger.info(f"Created job {job_id} with {len(cleaned_urls)} URLs")
+        logger.info(f"Job {job_id} stored in analysis_results: {job_id in analysis_results}")
+        
+        # Initialize analyzers
+        llm_provider = request.llm_provider if request else "openai"
+        video_limit = request.video_limit if request else 10
+        
+        # Start processing with direct pipeline approach
+        asyncio.create_task(
+            process_creators_pipeline(job_id, cleaned_urls, video_limit, llm_provider)
         )
+        
+        # Small delay to ensure job is properly stored before returning
+        await asyncio.sleep(0.1)
         
         return {
             "job_id": job_id,
@@ -764,10 +771,25 @@ async def bulk_analyze(
 @app.get("/api/bulk-analyze/{job_id}")
 async def get_bulk_analysis_status(job_id: str):
     """Get status of a bulk analysis job"""
+    logger.info(f"Status request for job_id: {job_id}")
+    logger.info(f"Available job_ids: {list(analysis_results.keys())}")
+    
+    # Wait a bit and retry if job not found initially (in case of race condition)
     if job_id not in analysis_results:
-        raise HTTPException(status_code=404, detail="Job not found")
+        logger.warning(f"Job {job_id} not found initially, waiting and retrying...")
+        await asyncio.sleep(0.5)
+        
+    if job_id not in analysis_results:
+        logger.error(f"Job {job_id} not found in analysis_results after retry")
+        available_jobs = list(analysis_results.keys())
+        raise HTTPException(
+            status_code=404, 
+            detail=f"Job {job_id} not found. Available jobs: {available_jobs[:5]}"
+        )
         
     job = analysis_results[job_id]
+    logger.info(f"Job {job_id} status: {job['status']}")
+    
     return {
         "job_id": job_id,
         "status": job['status'],
@@ -776,6 +798,12 @@ async def get_bulk_analysis_status(job_id: str):
         "processed_urls": len(job['results']) + len(job['failed_urls']),
         "failed_urls": job['failed_urls']
     }
+
+@app.get("/api/bulk-analyze/{job_id}/status")
+async def get_bulk_analysis_status_alias(job_id: str):
+    """Alias for get_bulk_analysis_status to match frontend expectations"""
+    logger.info(f"Status alias request for job_id: {job_id}")
+    return await get_bulk_analysis_status(job_id)
 
 @app.get("/api/bulk-analyze/{job_id}/results")
 async def get_bulk_analysis_results(job_id: str):
@@ -851,7 +879,7 @@ async def download_bulk_analysis_csv(job_id: str):
     )
 
 @app.post("/api/analyze-bulk", response_model=BulkAnalysisResponse)
-async def analyze_bulk(request: BulkAnalysisRequest, background_tasks: BackgroundTasks):
+async def analyze_bulk(request: BulkAnalysisRequest):
     """
     Analyze multiple YouTube creators' recent videos for content compliance
     """
@@ -860,19 +888,19 @@ async def analyze_bulk(request: BulkAnalysisRequest, background_tasks: Backgroun
         youtube_analyzer = YouTubeAnalyzer()
         llm_analyzer = LLMAnalyzer(provider=request.llm_provider)
         
-        # Create processor with configuration
+        # Create processor with configuration for true concurrency
         config = ProcessingConfig(
-            max_concurrent_transcripts=20,  # Increased from 10
-            max_concurrent_llm=10,  # Increased from 5
-            batch_size=5,  # Increased from 3
-            batch_delay=0.5  # Reduced from 1.0
+            max_concurrent_transcripts=20,  # Set to 20 as requested
+            max_concurrent_llm=10,  # Moderate LLM concurrency
+            batch_size=5,  # Smaller batches
+            batch_delay=0.0  # No delay as requested
         )
         processor = CreatorProcessor(youtube_analyzer, llm_analyzer, config)
         
         # Convert HttpUrl objects to strings
         urls = [str(url).strip() for url in request.urls]
         
-        # Process creators through the pipeline
+        # Process creators through the pipeline with full concurrency
         results = await processor.process_creators(urls, request.video_limit)
         
         # Calculate statistics
@@ -891,5 +919,142 @@ async def analyze_bulk(request: BulkAnalysisRequest, background_tasks: Backgroun
         logger.error(f"Error in bulk analysis: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
+async def process_creators_pipeline(job_id: str, urls: List[str], video_limit: int, llm_provider: str):
+    """Simple pipeline: Pull transcripts -> LLM queue -> Gather results -> Return results"""
+    try:
+        logger.info(f"Starting pipeline processing for job {job_id} with {len(urls)} URLs")
+        
+        # Initialize analyzers
+        youtube_analyzer = YouTubeAnalyzer()
+        llm_analyzer = LLMAnalyzer(provider=llm_provider)
+        
+        # Process creators in small batches to avoid overwhelming APIs
+        batch_size = 3
+        successful = 0
+        failed = 0
+        
+        for i in range(0, len(urls), batch_size):
+            batch_urls = urls[i:i + batch_size]
+            logger.info(f"Processing batch {i//batch_size + 1}: {len(batch_urls)} URLs")
+            
+            # Process batch concurrently
+            tasks = []
+            for url in batch_urls:
+                task = process_single_creator(url, video_limit, youtube_analyzer, llm_analyzer, job_id)
+                tasks.append(task)
+            
+            # Wait for batch to complete
+            batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            # Count results
+            for result in batch_results:
+                if isinstance(result, Exception):
+                    failed += 1
+                    logger.error(f"Batch processing error: {result}")
+                elif result and result.get("status") == "success":
+                    successful += 1
+                else:
+                    failed += 1
+            
+            # Small delay between batches to avoid rate limits
+            if i + batch_size < len(urls):
+                await asyncio.sleep(2)
+        
+        # Mark job as complete
+        total_processed = successful + failed
+        analysis_results[job_id]['status'] = 'completed'
+        analysis_results[job_id]['completed_at'] = datetime.now().isoformat()
+        analysis_results[job_id]['processed_urls'] = total_processed
+        
+        logger.info(f"Pipeline completed for job {job_id}: {successful} successful, {failed} failed")
+        
+    except Exception as e:
+        logger.error(f"Error in pipeline processing: {str(e)}")
+        if job_id in analysis_results:
+            analysis_results[job_id]['status'] = 'failed'
+            analysis_results[job_id]['error'] = str(e)
+            analysis_results[job_id]['completed_at'] = datetime.now().isoformat()
+
+async def process_single_creator(url: str, video_limit: int, youtube_analyzer, llm_analyzer, job_id: str):
+    """Process a single creator through the pipeline: transcripts -> LLM -> results"""
+    try:
+        logger.info(f"Step 1: Getting channel data for {url}")
+        
+        # Step 1: Pull transcripts
+        channel_data = await youtube_analyzer.analyze_channel_async(
+            url, 
+            video_limit=video_limit,
+            use_concurrent=True
+        )
+        
+        if not channel_data or not channel_data.get('videos'):
+            logger.warning(f"No channel data or videos found for {url}")
+            analysis_results[job_id]['failed_urls'].append({
+                'url': url,
+                'error': 'No channel data or videos with transcripts found'
+            })
+            return {"status": "failed", "url": url}
+        
+        logger.info(f"Step 2: Sending {len(channel_data['videos'])} videos to LLM for {url}")
+        
+        # Step 2: LLM queue - send to OpenAI for analysis
+        analysis_result = await llm_analyzer.analyze_channel_content_async(channel_data)
+        
+        logger.info(f"Step 3: Got LLM results for {url}")
+        
+        # Step 3: Gather results and format properly
+        channel_name = channel_data.get('channel_name', '')
+        channel_handle = channel_data.get('channel_handle', '')
+        
+        # Clean channel name/handle
+        if isinstance(channel_name, str):
+            channel_name = channel_name.replace('@', '')
+        if isinstance(channel_handle, str):
+            channel_handle = channel_handle.replace('@', '')
+            
+        if not channel_name and channel_data.get('channel_id'):
+            channel_name = f"Channel {channel_data['channel_id']}"
+        
+        # Step 4: Return results - store in job results
+        final_result = {
+            "url": url,
+            "channel_id": channel_data.get('channel_id', "unknown"),
+            "channel_name": channel_name or "Unknown",
+            "channel_handle": channel_handle or "Unknown", 
+            "video_analyses": analysis_result.get('video_analyses', []),
+            "summary": analysis_result.get('summary', {}),
+            "status": "success"
+        }
+        
+        # Store result
+        analysis_results[job_id]['results'][url] = final_result
+        logger.info(f"Step 4: Stored results for {url}")
+        
+        return final_result
+        
+    except Exception as e:
+        logger.error(f"Error processing creator {url}: {str(e)}")
+        analysis_results[job_id]['failed_urls'].append({
+            'url': url,
+            'error': str(e)
+        })
+        return {"status": "failed", "url": url, "error": str(e)}
+
+@app.get("/api/debug/jobs")
+async def get_all_jobs():
+    """Debug endpoint to list all jobs"""
+    return {
+        "total_jobs": len(analysis_results),
+        "jobs": {
+            job_id: {
+                "status": job["status"],
+                "started_at": job["started_at"],
+                "total_urls": job["total_urls"],
+                "processed_urls": len(job["results"]) + len(job["failed_urls"])
+            }
+            for job_id, job in analysis_results.items()
+        }
+    }
+
 if __name__ == "__main__":
-    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True) 
+    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
