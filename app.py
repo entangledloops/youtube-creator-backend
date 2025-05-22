@@ -102,9 +102,13 @@ class AnalysisResponse(BaseModel):
     channel_handle: str
     video_analyses: List[dict]
     summary: dict
+    status: str = "success"  # Add status field with default value
 
 class BulkAnalysisResponse(BaseModel):
     results: List[Dict[str, Any]]
+    total_processed: int
+    successful: int
+    failed: int
 
 # Initialize analyzers
 youtube_api_key = os.getenv("YOUTUBE_API_KEY")
@@ -139,7 +143,8 @@ async def analyze_channel(request: ChannelAnalysisRequest):
                 "channel_name": channel_data.get('channel_name', "Unknown"),
                 "channel_handle": channel_data.get('channel_handle', "Unknown"),
                 "video_analyses": [],
-                "summary": {}
+                "summary": {},
+                "status": "failed"
             }
             
         # Analyze content against compliance categories
@@ -152,7 +157,10 @@ async def analyze_channel(request: ChannelAnalysisRequest):
         return analysis_results
     except Exception as e:
         logger.error(f"Error analyzing channel: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        return {
+            "error": str(e),
+            "status": "failed"
+        }
 
 @app.post("/analyze/video", response_model=AnalysisResponse)
 async def analyze_video(request: VideoAnalysisRequest):
@@ -220,7 +228,8 @@ async def analyze_video(request: VideoAnalysisRequest):
                         "results": {}
                     }
                 }],
-                "summary": {}
+                "summary": {},
+                "status": "failed"
             }
             
         logger.info(f"Retrieved transcript for video {video_id}, length: {len(transcript['full_text'])} characters")
@@ -268,7 +277,10 @@ async def analyze_video(request: VideoAnalysisRequest):
         }
     except Exception as e:
         logger.error(f"Error analyzing video: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        return {
+            "error": str(e),
+            "status": "failed"
+        }
 
 @app.post("/api/analyze-creator", response_model=AnalysisResponse)
 async def analyze_creator(request: CreatorAnalysisRequest):
@@ -316,7 +328,8 @@ async def analyze_creator(request: CreatorAnalysisRequest):
                 "channel_name": channel_name or "Unknown",
                 "channel_handle": channel_handle or "Unknown",
                 "video_analyses": [],
-                "summary": {}
+                "summary": {},
+                "status": "failed"
             }
             
         # Analyze content against compliance categories using async processing
@@ -348,7 +361,10 @@ async def analyze_creator(request: CreatorAnalysisRequest):
         return analysis_results
     except Exception as e:
         logger.error(f"Error analyzing creator: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        return {
+            "error": str(e),
+            "status": "failed"
+        }
 
 @app.post("/api/analyze-multiple")
 async def analyze_multiple_urls(request: MultipleURLsRequest):
@@ -589,7 +605,8 @@ async def process_creator(url: str, video_limit: int, llm_provider: str, job_id:
                 "channel_name": channel_name or "Unknown",
                 "channel_handle": channel_handle or "Unknown",
                 "video_analyses": [],
-                "summary": {}
+                "summary": {},
+                "status": "failed"
             }
             analysis_results[job_id]['processed_urls'] += 1
             return
@@ -845,10 +862,10 @@ async def analyze_bulk(request: BulkAnalysisRequest, background_tasks: Backgroun
         
         # Create processor with configuration
         config = ProcessingConfig(
-            max_concurrent_transcripts=10,  # Adjust based on your needs
-            max_concurrent_llm=5,  # Adjust based on your needs
-            batch_size=3,  # Process 3 creators at a time
-            batch_delay=1.0  # 1 second delay between batches
+            max_concurrent_transcripts=20,  # Increased from 10
+            max_concurrent_llm=10,  # Increased from 5
+            batch_size=5,  # Increased from 3
+            batch_delay=0.5  # Reduced from 1.0
         )
         processor = CreatorProcessor(youtube_analyzer, llm_analyzer, config)
         
@@ -858,8 +875,16 @@ async def analyze_bulk(request: BulkAnalysisRequest, background_tasks: Backgroun
         # Process creators through the pipeline
         results = await processor.process_creators(urls, request.video_limit)
         
+        # Calculate statistics
+        total_processed = len(results)
+        successful = sum(1 for r in results if r.get("status") == "success")
+        failed = total_processed - successful
+        
         return {
-            "results": results
+            "results": results,
+            "total_processed": total_processed,
+            "successful": successful,
+            "failed": failed
         }
         
     except Exception as e:
