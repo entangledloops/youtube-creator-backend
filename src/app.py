@@ -17,9 +17,9 @@ from datetime import datetime
 import json
 import time
 
-from youtube_analyzer import YouTubeAnalyzer
-from llm_analyzer import LLMAnalyzer
-from creator_processor import CreatorProcessor, ProcessingConfig
+from src.youtube_analyzer import YouTubeAnalyzer
+from src.llm_analyzer import LLMAnalyzer
+from src.creator_processor import CreatorProcessor, ProcessingConfig
 
 # Configure logging
 logging.basicConfig(
@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 # Load environment variables
 logger.info("Loading environment variables...")
-env_path = os.path.join(os.path.dirname(__file__), '.env')
+env_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), '.env')
 logger.info(f"Looking for .env file at: {env_path}")
 
 # Force reload of environment variables

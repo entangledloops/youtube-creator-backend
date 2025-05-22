@@ -15,7 +15,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class LLMAnalyzer:
-    def __init__(self, provider="local", categories_file="../data/YouTube_Controversy_Categories.csv"):
+    def __init__(self, provider="local", categories_file=None):
         """
         Initialize LLM analyzer with specified provider
         
@@ -24,6 +24,14 @@ class LLMAnalyzer:
             categories_file: Path to CSV file with controversy categories
         """
         self.provider = provider
+        
+        # Handle default categories file path
+        if categories_file is None:
+            # Get the project root directory (parent of src)
+            src_dir = os.path.dirname(__file__)
+            project_root = os.path.dirname(src_dir)
+            categories_file = os.path.join(project_root, "data", "YouTube_Controversy_Categories.csv")
+        
         self.categories_df = pd.read_csv(categories_file)
         
         if provider == "local":

@@ -7,8 +7,8 @@ import time
 import sys
 from typing import Dict, List, Any, Optional
 from dataclasses import dataclass
-from youtube_analyzer import YouTubeAnalyzer
-from llm_analyzer import LLMAnalyzer
+from src.youtube_analyzer import YouTubeAnalyzer
+from src.llm_analyzer import LLMAnalyzer
 import statistics
 
 # Get the logger for this module

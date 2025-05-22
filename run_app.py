@@ -10,6 +10,5 @@ import uvicorn
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 
 if __name__ == "__main__":
-    # Import and run the FastAPI app from src/
-    from app import app
-    uvicorn.run(app, host="0.0.0.0", port=8000, reload=True) 
+    # Run the FastAPI app using import string for proper reload support
+    uvicorn.run("src.app:app", host="0.0.0.0", port=8000, reload=True) 
