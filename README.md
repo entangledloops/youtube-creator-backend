@@ -75,6 +75,10 @@ youtube-creator-backend/
    # Toggle between "local" or "openai"
    LLM_PROVIDER=openai
 
+   # Model Configuration
+   OPENAI_MODEL=gpt-4o-mini
+   LLM_CONTEXT_SIZE=128000
+
    # YouTube API (optional, for enhanced functionality)
    YOUTUBE_API_KEY=your_youtube_api_key_here
    ```
@@ -229,6 +233,54 @@ Each category is scored from 0 to 1:
 - **0.25-0.5**: Minor or ambiguous instances
 - **0.75-1**: Clear violations
 
+## Model Configuration
+
+The system supports configurable LLM models and context sizes for handling various transcript lengths:
+
+### Supported Models
+
+**OpenAI Models:**
+- `gpt-4o-mini` (128K context) - Default, cost-effective
+- `gpt-4-turbo` (128K context) - Higher accuracy
+- `gpt-4o` (128K context) - Latest model
+- `gpt-3.5-turbo` (16K context) - Legacy support
+
+**Local Models:**
+- Any OpenAI-compatible local LLM server (Mistral, Llama, etc.)
+
+### Context Size Configuration
+
+The `LLM_CONTEXT_SIZE` setting controls how much text can be processed:
+
+- **128,000 tokens**: Standard for modern models (gpt-4o-mini, gpt-4-turbo)
+- **32,000 tokens**: For smaller context models
+- **200,000+ tokens**: For future large-context models
+
+The system automatically:
+- Reserves 1,000 tokens for responses
+- Truncates transcripts that exceed the available context
+- Logs warnings when truncation occurs
+
+### Example Configurations
+
+**High-capacity setup (recommended):**
+```bash
+OPENAI_MODEL=gpt-4o-mini
+LLM_CONTEXT_SIZE=128000
+```
+
+**Large transcript processing:**
+```bash
+OPENAI_MODEL=gpt-4-turbo
+LLM_CONTEXT_SIZE=128000
+```
+
+**Cost-optimized setup:**
+```bash
+OPENAI_MODEL=gpt-3.5-turbo
+LLM_CONTEXT_SIZE=16000
+```
+
 ## Advanced Features
 
 ### Concurrent Processing Pipeline
@@ -296,6 +348,8 @@ Required variables in `.env`:
 OPENAI_API_KEY=sk-...              # Required for OpenAI provider
 LOCAL_LLM_URL=http://localhost:1234/v1  # Required for local provider
 LLM_PROVIDER=openai                # Default provider
+OPENAI_MODEL=gpt-4o-mini           # OpenAI model to use
+LLM_CONTEXT_SIZE=128000           # Maximum context window size
 YOUTUBE_API_KEY=...                # Optional, enhances functionality
 ```
 

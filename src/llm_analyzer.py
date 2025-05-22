@@ -25,6 +25,15 @@ class LLMAnalyzer:
         """
         self.provider = provider
         
+        # Load model configuration from environment
+        self.openai_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        self.context_size = int(os.getenv("LLM_CONTEXT_SIZE", "128000"))
+        
+        # Calculate max input tokens (reserve 1000 tokens for response)
+        self.max_input_tokens = max(1000, self.context_size - 1000)
+        
+        logger.info(f"LLM Configuration - Model: {self.openai_model}, Context Size: {self.context_size}, Max Input: {self.max_input_tokens}")
+        
         # Handle default categories file path
         if categories_file is None:
             # Get the project root directory (parent of src)
@@ -59,7 +68,8 @@ class LLMAnalyzer:
         """Format prompt for analyzing transcript against categories"""
         categories = self._prepare_categories_prompt()
         
-        prompt = f"""You are an objective content compliance analyzer.
+        # Calculate rough prompt size without transcript
+        base_prompt = f"""You are an objective content compliance analyzer.
 
 TASK: Evaluate the following YouTube video transcript against each content compliance category. For each category, provide a score from 0 to 1, where:
 - 0: No violation detected
@@ -72,7 +82,7 @@ CONTENT COMPLIANCE CATEGORIES:
 {categories}
 
 TRANSCRIPT:
-{transcript_text[:8000]}  # Limiting transcript length to avoid context window issues
+PLACEHOLDER_FOR_TRANSCRIPT
 
 INSTRUCTIONS:
 1. For EACH category listed above, provide:
@@ -94,6 +104,20 @@ INSTRUCTIONS:
 5. If no violations found at all, return an empty JSON object: {{}}
 6. Ensure all JSON is properly formatted with double quotes around keys and string values.
 """
+        
+        # Estimate tokens used by base prompt (roughly 4 chars per token)
+        base_prompt_tokens = len(base_prompt) // 4
+        available_transcript_tokens = self.max_input_tokens - base_prompt_tokens
+        
+        # Truncate transcript if necessary (roughly 4 chars per token)
+        max_transcript_chars = available_transcript_tokens * 4
+        if len(transcript_text) > max_transcript_chars:
+            logger.warning(f"Transcript too long ({len(transcript_text)} chars), truncating to {max_transcript_chars} chars")
+            transcript_text = transcript_text[:max_transcript_chars]
+        
+        # Replace placeholder with actual transcript
+        prompt = base_prompt.replace("PLACEHOLDER_FOR_TRANSCRIPT", transcript_text)
+        
         return prompt
     
     def _extract_valid_json(self, text):
@@ -189,6 +213,7 @@ INSTRUCTIONS:
     
     def _query_local_llm(self, prompt: str, video_id: str) -> Dict[str, Any]:
         """Query local Mistral LLM instance (synchronous)"""
+        logger.info(f"🏠 LOCAL LLM CALLED: Querying local LLM at {self.api_base_url}")
         url = f"{self.api_base_url}/chat/completions"
         
         payload = {
@@ -246,6 +271,7 @@ INSTRUCTIONS:
     
     def _query_openai(self, prompt: str, video_id: str) -> Dict[str, Any]:
         """Query OpenAI API (synchronous version)"""
+        logger.info(f"🤖 OPENAI CALLED: Querying OpenAI API at {self.api_base_url}")
         url = f"{self.api_base_url}/chat/completions"
         
         # Log the actual API key being used (first 4 and last 4 chars for security)
@@ -261,14 +287,8 @@ INSTRUCTIONS:
         auth_header = headers["Authorization"]
         logger.info(f"Authorization header: {auth_header[:10]}...")
         
-        # Truncate prompt if it's too long
-        max_tokens = 4000  # Adjust based on model's context window
-        if len(prompt) > max_tokens * 4:  # Rough estimate: 4 chars per token
-            logger.warning(f"Prompt too long ({len(prompt)} chars), truncating to {max_tokens * 4} chars")
-            prompt = prompt[:max_tokens * 4]
-        
         payload = {
-            "model": "gpt-4o-mini",  # Using GPT-4o-mini model
+            "model": self.openai_model,
             "messages": [
                 {"role": "system", "content": "You are a content compliance analyst that evaluates content against specific guidelines."},
                 {"role": "user", "content": prompt}
@@ -325,14 +345,8 @@ INSTRUCTIONS:
             "Content-Type": "application/json"
         }
         
-        # Truncate prompt if it's too long
-        max_tokens = 4000  # Adjust based on model's context window
-        if len(prompt) > max_tokens * 4:  # Rough estimate: 4 chars per token
-            logger.warning(f"Prompt too long ({len(prompt)} chars), truncating to {max_tokens * 4} chars")
-            prompt = prompt[:max_tokens * 4]
-        
         payload = {
-            "model": "gpt-4o-mini",  # Using GPT-4o-mini model
+            "model": self.openai_model,
             "messages": [
                 {"role": "system", "content": "You are a content compliance analyst that evaluates content against specific guidelines."},
                 {"role": "user", "content": prompt}

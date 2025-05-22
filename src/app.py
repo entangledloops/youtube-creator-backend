@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, UploadFile, File, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
+from sse_starlette.sse import EventSourceResponse
 from pydantic import BaseModel, HttpUrl
 from typing import Optional, List, Dict, Any
 import logging
@@ -54,6 +55,10 @@ else:
     logger.error("Please create a .env file with your OpenAI API key")
     raise ValueError("No .env file found")
 
+# Get default LLM provider from environment
+default_llm_provider = os.getenv("LLM_PROVIDER", "local")
+logger.info(f"Default LLM provider from environment: {default_llm_provider}")
+
 # Initialize FastAPI app
 app = FastAPI(
     title="YouTube Content Compliance Analyzer",
@@ -70,28 +75,26 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Input validation models
-class ChannelAnalysisRequest(BaseModel):
-    channel_url: HttpUrl
-    video_limit: Optional[int] = 5
-    llm_provider: Optional[str] = "local"  # "local" or "openai"
-
-class VideoAnalysisRequest(BaseModel):
-    video_url: HttpUrl
-    llm_provider: Optional[str] = "local"  # "local" or "openai"
-
-class MultipleURLsRequest(BaseModel):
-    urls: List[str]
-    llm_provider: Optional[str] = "local"  # "local" or "openai"
+# Input validation models (only for active endpoints)
 
 class CreatorAnalysisRequest(BaseModel):
     creator_url: HttpUrl
     video_limit: int = 10
-    llm_provider: str = "openai"
+    llm_provider: Optional[str] = None  # Will be set dynamically
+    
+    def __init__(self, **data):
+        if data.get('llm_provider') is None:
+            data['llm_provider'] = os.getenv("LLM_PROVIDER", "local")
+        super().__init__(**data)
 
 class BulkAnalysisRequest(BaseModel):
     video_limit: int = 10
-    llm_provider: str = "openai"
+    llm_provider: Optional[str] = None  # Will be set dynamically
+    
+    def __init__(self, **data):
+        if data.get('llm_provider') is None:
+            data['llm_provider'] = os.getenv("LLM_PROVIDER", "local")
+        super().__init__(**data)
 
 # Response models
 class ErrorResponse(BaseModel):
@@ -105,11 +108,7 @@ class AnalysisResponse(BaseModel):
     summary: dict
     status: str = "success"  # Add status field with default value
 
-class BulkAnalysisResponse(BaseModel):
-    results: List[Dict[str, Any]]
-    total_processed: int
-    successful: int
-    failed: int
+
 
 # Initialize analyzers
 youtube_api_key = os.getenv("YOUTUBE_API_KEY")
@@ -122,166 +121,7 @@ analysis_results = {}
 async def root():
     return {"message": "YouTube Content Compliance Analyzer API"}
 
-@app.post("/analyze/channel", response_model=AnalysisResponse)
-async def analyze_channel(request: ChannelAnalysisRequest):
-    """
-    Analyze a YouTube channel for content compliance
-    """
-    try:
-        # Initialize LLM analyzer with specified provider
-        llm_analyzer = LLMAnalyzer(provider=request.llm_provider)
-        
-        # Get channel data (videos and transcripts)
-        channel_data = youtube_analyzer.analyze_channel(request.channel_url, video_limit=request.video_limit)
-        
-        if not channel_data:
-            raise HTTPException(status_code=404, detail="Could not extract channel data")
-            
-        # If no videos with transcripts were found
-        if not channel_data.get('videos'):
-            return {
-                "channel_id": channel_data.get('channel_id', "unknown"),
-                "channel_name": channel_data.get('channel_name', "Unknown"),
-                "channel_handle": channel_data.get('channel_handle', "Unknown"),
-                "video_analyses": [],
-                "summary": {},
-                "status": "failed"
-            }
-            
-        # Analyze content against compliance categories
-        analysis_results = llm_analyzer.analyze_channel_content(channel_data)
-        
-        # Add channel name and handle to the response
-        analysis_results["channel_name"] = channel_data.get('channel_name', "Unknown")
-        analysis_results["channel_handle"] = channel_data.get('channel_handle', "Unknown")
-        
-        return analysis_results
-    except Exception as e:
-        logger.error(f"Error analyzing channel: {str(e)}")
-        return {
-            "error": str(e),
-            "status": "failed"
-        }
 
-@app.post("/analyze/video", response_model=AnalysisResponse)
-async def analyze_video(request: VideoAnalysisRequest):
-    """
-    Analyze a single YouTube video for content compliance
-    """
-    try:
-        # Extract video ID from URL
-        video_url = str(request.video_url).strip()
-        logger.info(f"Analyzing video URL: {video_url}")
-        video_id = None
-        
-        if "youtube.com/watch" in video_url and "v=" in video_url:
-            video_id = video_url.split("v=")[1].split("&")[0] if "&" in video_url.split("v=")[1] else video_url.split("v=")[1]
-            logger.info(f"Extracted video ID from youtube.com/watch URL: {video_id}")
-        elif "youtu.be/" in video_url:
-            video_id = video_url.split("youtu.be/")[1].split("?")[0] if "?" in video_url.split("youtu.be/")[1] else video_url.split("youtu.be/")[1]
-            logger.info(f"Extracted video ID from youtu.be URL: {video_id}")
-        else:
-            logger.warning(f"Could not extract video ID from URL: {video_url}")
-            
-        if not video_id:
-            raise HTTPException(status_code=400, detail=f"Invalid YouTube video URL: {video_url}")
-        
-        # Get video title by scraping (since we don't have the full data from API)
-        import requests
-        from bs4 import BeautifulSoup
-        
-        response = requests.get(video_url)
-        soup = BeautifulSoup(response.text, 'html.parser')
-        title = soup.find('title').text.replace(' - YouTube', '')
-        logger.info(f"Retrieved video title: {title}")
-        
-        # Get channel ID from the video
-        channel_id = youtube_analyzer.get_channel_id_from_video(video_id)
-        logger.info(f"Retrieved channel ID: {channel_id}")
-        
-        # Get channel name and handle
-        channel_name = "Unknown"
-        channel_handle = "Unknown"
-        try:
-            channel_data = youtube_analyzer.get_channel_info(channel_id)
-            if channel_data:
-                channel_name = channel_data.get('channel_name', '').replace('@', '') or "Unknown"
-                channel_handle = channel_data.get('channel_handle', '').replace('@', '') or "Unknown"
-        except Exception as e:
-            logger.warning(f"Could not get channel info: {str(e)}")
-        
-        # Get video transcript
-        transcript = youtube_analyzer.get_transcript(video_id)
-        if not transcript:
-            logger.warning(f"No transcript available for video {video_id}")
-            # Return a partial result with video info but no analysis
-            return {
-                "channel_id": channel_id,
-                "channel_name": channel_name,
-                "channel_handle": channel_handle,
-                "video_analyses": [{
-                    "video_id": video_id,
-                    "video_title": title,
-                    "video_url": video_url,
-                    "analysis": {
-                        "video_id": video_id,
-                        "message": "No transcript available for this video. Unable to perform content analysis.",
-                        "results": {}
-                    }
-                }],
-                "summary": {},
-                "status": "failed"
-            }
-            
-        logger.info(f"Retrieved transcript for video {video_id}, length: {len(transcript['full_text'])} characters")
-        
-        # Initialize LLM analyzer with specified provider
-        llm_analyzer = LLMAnalyzer(provider=request.llm_provider)
-        
-        # Analyze transcript
-        analysis = llm_analyzer.analyze_transcript(
-            transcript_text=transcript['full_text'],
-            video_title=title,
-            video_id=video_id
-        )
-        
-        logger.info(f"Analysis completed for video {video_id}, found {len(analysis.get('results', {}))} categories with violations")
-        
-        return {
-            "channel_id": channel_id,
-            "channel_name": channel_name,
-            "channel_handle": channel_handle,
-            "video_analyses": [{
-                "video_id": video_id,
-                "video_title": title,
-                "video_url": video_url,
-                "analysis": analysis
-            }],
-            "summary": {
-                # Simple summary with just the results from this video
-                category: {
-                    "max_score": analysis.get("results", {}).get(category, {}).get("score", 0),
-                    "average_score": analysis.get("results", {}).get(category, {}).get("score", 0),
-                    "videos_with_violations": 1 if category in analysis.get("results", {}) else 0,
-                    "total_videos": 1,
-                    "examples": [{
-                        "video_id": video_id,
-                        "video_title": title,
-                        "video_url": video_url,
-                        "score": analysis.get("results", {}).get(category, {}).get("score", 0),
-                        "evidence": analysis.get("results", {}).get(category, {}).get("evidence", [])[0] 
-                            if analysis.get("results", {}).get(category, {}).get("evidence") else ""
-                    }] if category in analysis.get("results", {}) else []
-                } for category in llm_analyzer.categories_df['Category'].tolist() 
-                if category in analysis.get("results", {})
-            }
-        }
-    except Exception as e:
-        logger.error(f"Error analyzing video: {str(e)}")
-        return {
-            "error": str(e),
-            "status": "failed"
-        }
 
 @app.post("/api/analyze-creator", response_model=AnalysisResponse)
 async def analyze_creator(request: CreatorAnalysisRequest):
@@ -289,8 +129,12 @@ async def analyze_creator(request: CreatorAnalysisRequest):
     Analyze a YouTube creator's recent videos for content compliance
     """
     try:
-        # Initialize LLM analyzer with specified provider
-        llm_analyzer = LLMAnalyzer(provider=request.llm_provider)
+        # Always use environment LLM_PROVIDER (ignore frontend request)
+        actual_provider = os.getenv("LLM_PROVIDER", "local")
+        logger.info(f"🔧 Creator analysis using LLM provider: {actual_provider}")
+        
+        # Initialize LLM analyzer with environment provider (ignore request)
+        llm_analyzer = LLMAnalyzer(provider=actual_provider)
         
         # Convert HttpUrl to string
         creator_url = str(request.creator_url).strip()
@@ -298,7 +142,7 @@ async def analyze_creator(request: CreatorAnalysisRequest):
         
         # Get channel data (videos and transcripts) asynchronously
         # Only use concurrent processing for OpenAI
-        use_concurrent = request.llm_provider == "openai"
+        use_concurrent = actual_provider == "openai"
         channel_data = await youtube_analyzer.analyze_channel_async(
             creator_url, 
             video_limit=request.video_limit,
@@ -367,85 +211,25 @@ async def analyze_creator(request: CreatorAnalysisRequest):
             "status": "failed"
         }
 
-@app.post("/api/analyze-multiple")
-async def analyze_multiple_urls(request: MultipleURLsRequest):
+@app.get("/api/analyze-progress")
+async def analyze_progress():
     """
-    Analyze multiple YouTube URLs (videos or channels)
+    Server-Sent Events (SSE) endpoint for real-time progress updates
     """
-    try:
-        # Initialize analyzers
-        llm_analyzer = LLMAnalyzer(provider=request.llm_provider)
-        
-        # Deduplicate URLs while preserving order
-        unique_urls = []
-        seen = set()
-        for url in request.urls:
-            if url not in seen:
-                unique_urls.append(url)
-                seen.add(url)
-        
-        logger.info(f"Processing {len(unique_urls)} unique URLs out of {len(request.urls)} submitted")
-        
-        # Process each URL
-        results = []
-        tasks = []
-        
-        for url in unique_urls:
-            # Normalize URL to ensure consistent handling
-            url = str(url).strip()
-            
-            if "youtube.com/channel/" in url or "youtube.com/c/" in url or "youtube.com/@" in url:
-                # Channel URL
-                channel_request = ChannelAnalysisRequest(
-                    channel_url=url,
-                    llm_provider=request.llm_provider
-                )
-                tasks.append(analyze_channel(channel_request))
-            elif "youtube.com/watch" in url or "youtu.be/" in url:
-                # Video URL - ensure the URL is properly formatted
-                video_request = VideoAnalysisRequest(
-                    video_url=url,
-                    llm_provider=request.llm_provider
-                )
-                tasks.append(analyze_video(video_request))
-            else:
-                logger.warning(f"Unrecognized URL format: {url}")
-                results.append({
-                    "url": url,
-                    "error": "Unrecognized URL format"
+    async def event_generator():
+        while True:
+            # This is a placeholder implementation
+            # In a real implementation, you'd track actual progress from your analysis jobs
+            yield {
+                "event": "progress",
+                "data": json.dumps({
+                    "message": "Analysis in progress...",
+                    "timestamp": datetime.now().isoformat()
                 })
-        
-        # Run all tasks concurrently
-        task_results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        # Process results
-        valid_urls = [u for u in unique_urls if "youtube.com/" in u or "youtu.be/" in u]
-        logger.info(f"Processing results for {len(valid_urls)} valid URLs")
-        
-        for i, (url, result) in enumerate(zip(valid_urls, task_results)):
-            if isinstance(result, Exception):
-                # Log the error but include it in results
-                logger.error(f"Error processing URL {url}: {str(result)}")
-                results.append({
-                    "url": url,
-                    "error": str(result)
-                })
-            else:
-                results.append({
-                    "url": url,
-                    "analysis": result
-                })
-        
-        # Create a combined summary across all successful results
-        combined_summary = create_combined_summary(results)
-        
-        return {
-            "individual_results": results,
-            "combined_summary": combined_summary
-        }
-    except Exception as e:
-        logger.error(f"Error analyzing multiple URLs: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+            }
+            await asyncio.sleep(1)
+    
+    return EventSourceResponse(event_generator())
 
 def create_combined_summary(results: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
@@ -550,25 +334,12 @@ def create_combined_summary(results: List[Dict[str, Any]]) -> Dict[str, Any]:
     
     return summary
 
-@app.get("/categories")
-async def get_categories():
-    """
-    Get list of compliance categories with definitions
-    """
-    try:
-        import pandas as pd
-        categories_df = pd.read_csv("../data/YouTube_Controversy_Categories.csv")
-        categories = categories_df.to_dict(orient="records")
-        return {"categories": categories}
-    except Exception as e:
-        logger.error(f"Error getting categories: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
 async def process_creator(url: str, video_limit: int, llm_provider: str, job_id: str):
     """Process a single creator and store results"""
     try:
-        # Initialize LLM analyzer with specified provider
-        llm_analyzer = LLMAnalyzer(provider=llm_provider)
+        # Always use environment LLM_PROVIDER (ignore llm_provider parameter)
+        actual_provider = os.getenv("LLM_PROVIDER", "local")
+        llm_analyzer = LLMAnalyzer(provider=actual_provider)
         
         # Get channel data
         channel_data = await youtube_analyzer.analyze_channel_async(
@@ -746,9 +517,11 @@ async def bulk_analyze(
         logger.info(f"Created job {job_id} with {len(cleaned_urls)} URLs")
         logger.info(f"Job {job_id} stored in analysis_results: {job_id in analysis_results}")
         
-        # Initialize analyzers
-        llm_provider = request.llm_provider if request else "openai"
+        # Always use environment LLM_PROVIDER (ignore frontend request)
+        llm_provider = os.getenv("LLM_PROVIDER", "local")
         video_limit = request.video_limit if request else 10
+        
+        logger.info(f"🔧 Bulk analysis using LLM provider: {llm_provider}")
         
         # Start processing with direct pipeline approach
         asyncio.create_task(
@@ -768,36 +541,6 @@ async def bulk_analyze(
         logger.error(f"Error in bulk analysis: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/api/bulk-analyze/{job_id}")
-async def get_bulk_analysis_status(job_id: str):
-    """Get status of a bulk analysis job"""
-    logger.info(f"Status request for job_id: {job_id}")
-    logger.info(f"Available job_ids: {list(analysis_results.keys())}")
-    
-    # Wait a bit and retry if job not found initially (in case of race condition)
-    if job_id not in analysis_results:
-        logger.warning(f"Job {job_id} not found initially, waiting and retrying...")
-        await asyncio.sleep(0.5)
-        
-    if job_id not in analysis_results:
-        logger.error(f"Job {job_id} not found in analysis_results after retry")
-        available_jobs = list(analysis_results.keys())
-        raise HTTPException(
-            status_code=404, 
-            detail=f"Job {job_id} not found. Available jobs: {available_jobs[:5]}"
-        )
-        
-    job = analysis_results[job_id]
-    logger.info(f"Job {job_id} status: {job['status']}")
-    
-    return {
-        "job_id": job_id,
-        "status": job['status'],
-        "started_at": job['started_at'],
-        "total_urls": job['total_urls'],
-        "processed_urls": len(job['results']) + len(job['failed_urls']),
-        "failed_urls": job['failed_urls']
-    }
 
 @app.get("/api/bulk-analyze/{job_id}/status")
 async def get_bulk_analysis_status_alias(job_id: str):
@@ -906,48 +649,7 @@ async def download_bulk_analysis_csv(job_id: str):
         filename,
         media_type='text/csv',
         filename=filename
-    )
-
-@app.post("/api/analyze-bulk", response_model=BulkAnalysisResponse)
-async def analyze_bulk(request: BulkAnalysisRequest):
-    """
-    Analyze multiple YouTube creators' recent videos for content compliance
-    """
-    try:
-        # Initialize analyzers
-        youtube_analyzer = YouTubeAnalyzer()
-        llm_analyzer = LLMAnalyzer(provider=request.llm_provider)
-        
-        # Create processor with configuration for true concurrency
-        config = ProcessingConfig(
-            max_concurrent_transcripts=20,  # Set to 20 as requested
-            max_concurrent_llm=10,  # Moderate LLM concurrency
-            batch_size=5,  # Smaller batches
-            batch_delay=0.0  # No delay as requested
-        )
-        processor = CreatorProcessor(youtube_analyzer, llm_analyzer, config)
-        
-        # Convert HttpUrl objects to strings
-        urls = [str(url).strip() for url in request.urls]
-        
-        # Process creators through the pipeline with full concurrency
-        results = await processor.process_creators(urls, request.video_limit)
-        
-        # Calculate statistics
-        total_processed = len(results)
-        successful = sum(1 for r in results if r.get("status") == "success")
-        failed = total_processed - successful
-        
-        return {
-            "results": results,
-            "total_processed": total_processed,
-            "successful": successful,
-            "failed": failed
-        }
-        
-    except Exception as e:
-        logger.error(f"Error in bulk analysis: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+          )
 
 async def process_creators_pipeline(job_id: str, urls: List[str], video_limit: int, llm_provider: str):
     """Queue-based pipeline with timing and concurrency monitoring"""
@@ -957,9 +659,11 @@ async def process_creators_pipeline(job_id: str, urls: List[str], video_limit: i
         logger.info(f"🚀 Starting pipeline for job {job_id} with {len(urls)} URLs")
         logger.info(f"⚖️ Using 10 transcript workers (balanced for speed vs rate limits)")
         
-        # Initialize analyzers
+        # Always use environment LLM_PROVIDER (ignore any frontend input)
+        actual_llm_provider = os.getenv("LLM_PROVIDER", "local")
         youtube_analyzer = YouTubeAnalyzer()
-        llm_analyzer = LLMAnalyzer(provider=llm_provider)
+        logger.info(f"Creating LLMAnalyzer with provider='{actual_llm_provider}' in pipeline")
+        llm_analyzer = LLMAnalyzer(provider=actual_llm_provider)
         
         # Create queues for pipeline stages
         transcript_queue = asyncio.Queue(maxsize=1000)
@@ -1270,22 +974,4 @@ async def monitor_pipeline(job_id: str, transcript_queue: asyncio.Queue, llm_que
         except asyncio.CancelledError:
             break
         except Exception as e:
-            logger.error(f"💥 Monitor error: {e}")
-
-@app.get("/api/debug/jobs")
-async def get_all_jobs():
-    """Debug endpoint to list all jobs"""
-    return {
-        "total_jobs": len(analysis_results),
-        "jobs": {
-            job_id: {
-                "status": job["status"],
-                "started_at": job["started_at"],
-                "total_urls": job["total_urls"],
-                "processed_urls": len(job["results"]) + len(job["failed_urls"])
-            }
-            for job_id, job in analysis_results.items()
-        }
-    }
-
-# Entry point moved to ../run_app.py
+                          logger.error(f"💥 Monitor error: {e}")

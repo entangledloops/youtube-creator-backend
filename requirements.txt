@@ -10,3 +10,4 @@ pandas
 python-multipart
 aiohttp
 pytube
+sse-starlette
