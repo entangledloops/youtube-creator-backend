@@ -814,8 +814,29 @@ async def get_bulk_analysis_results(job_id: str):
     job = analysis_results[job_id]
     if job['status'] == 'processing':
         raise HTTPException(status_code=400, detail="Analysis still in progress")
+    
+    # Calculate counts for debugging
+    successful_count = len(job['results'])
+    failed_count = len(job['failed_urls'])
+    total_processed = successful_count + failed_count
+    
+    # Debug logging to help frontend troubleshooting
+    logger.info(f"🔍 RESULTS ENDPOINT DEBUG for job {job_id}:")
+    logger.info(f"   📊 Successful results: {successful_count}")
+    logger.info(f"   📊 Failed URLs: {failed_count}")
+    logger.info(f"   📊 Total processed: {total_processed}")
+    logger.info(f"   📊 Original total_urls: {job['total_urls']}")
+    
+    if failed_count > 0:
+        logger.info(f"   ❌ Failed URLs list: {[f['url'] for f in job['failed_urls']]}")
+        logger.info(f"   ❌ Failed error types: {[f.get('error_type', 'unknown') for f in job['failed_urls']]}")
+        for i, failed_url in enumerate(job['failed_urls'], 1):
+            logger.info(f"   ❌ Failure {i}: {failed_url['url']}")
+            logger.info(f"      └─ Error: {failed_url['error']}")
+            if 'channel_name' in failed_url:
+                logger.info(f"      └─ Channel: {failed_url['channel_name']} ({failed_url.get('video_count', 0)} videos)")
         
-    return {
+    response_data = {
         "job_id": job_id,
         "status": job['status'],
         "started_at": job['started_at'],
@@ -823,8 +844,17 @@ async def get_bulk_analysis_results(job_id: str):
         "total_urls": job['total_urls'],
         "processed_urls": job['processed_urls'],
         "results": job['results'],
-        "failed_urls": job['failed_urls']
+        "failed_urls": job['failed_urls'],
+        # Add explicit counts for frontend debugging
+        "summary_counts": {
+            "successful": successful_count,
+            "failed": failed_count, 
+            "total_processed": total_processed
+        }
     }
+    
+    logger.info(f"   📤 Sending to frontend: {successful_count} results, {failed_count} failed_urls")
+    return response_data
 
 @app.get("/api/bulk-analyze/{job_id}/csv")
 async def download_bulk_analysis_csv(job_id: str):
@@ -925,6 +955,7 @@ async def process_creators_pipeline(job_id: str, urls: List[str], video_limit: i
     
     try:
         logger.info(f"🚀 Starting pipeline for job {job_id} with {len(urls)} URLs")
+        logger.info(f"⚖️ Using 10 transcript workers (balanced for speed vs rate limits)")
         
         # Initialize analyzers
         youtube_analyzer = YouTubeAnalyzer()
@@ -956,8 +987,8 @@ async def process_creators_pipeline(job_id: str, urls: List[str], video_limit: i
         llm_workers = []
         result_workers = []
         
-        # 20 transcript workers as requested
-        for i in range(20):
+        # 10 transcript workers to balance speed vs rate limits
+        for i in range(10):
             worker = asyncio.create_task(
                 transcript_worker(i, transcript_queue, llm_queue, youtube_analyzer, timing_stats, job_id)
             )
@@ -1065,11 +1096,30 @@ async def transcript_worker(worker_id: int, transcript_queue: asyncio.Queue, llm
             transcript_time = time.time() - start_time
             timing_stats['transcript_times'].append(transcript_time)
             
-            if not channel_data or not channel_data.get('videos'):
-                logger.warning(f"❌ Worker {worker_id}: No data for {url}")
+            # Determine specific failure reason for clear frontend messaging
+            if not channel_data:
+                error_msg = f"Failed to access YouTube channel. The URL may be invalid, private, or the channel may not exist: {url}"
+                logger.warning(f"❌ Worker {worker_id}: Invalid channel URL - {url}")
                 analysis_results[job_id]['failed_urls'].append({
                     'url': url,
-                    'error': 'No channel data or videos with transcripts found'
+                    'error': error_msg,
+                    'error_type': 'invalid_channel'
+                })
+            elif not channel_data.get('videos'):
+                # More specific messaging based on what we found
+                channel_name = channel_data.get('channel_name', 'Unknown')
+                if channel_data.get('video_count', 0) == 0:
+                    error_msg = f"Channel '{channel_name}' has no videos available for analysis"
+                else:
+                    error_msg = f"Channel '{channel_name}' has {channel_data.get('video_count', 0)} videos, but none have transcripts available for analysis. Videos may be too old, in unsupported languages, or have captions disabled."
+                
+                logger.warning(f"❌ Worker {worker_id}: No transcripts available for {url} - {error_msg}")
+                analysis_results[job_id]['failed_urls'].append({
+                    'url': url,
+                    'error': error_msg,
+                    'error_type': 'no_transcripts',
+                    'channel_name': channel_name,
+                    'video_count': channel_data.get('video_count', 0)
                 })
             else:
                 logger.info(f"✅ Worker {worker_id}: Got {len(channel_data['videos'])} videos for {url} in {transcript_time:.2f}s")
@@ -1085,7 +1135,16 @@ async def transcript_worker(worker_id: int, transcript_queue: asyncio.Queue, llm
         except asyncio.CancelledError:
             break
         except Exception as e:
-            logger.error(f"💥 Transcript worker {worker_id} error: {e}")
+            url = item.get('url', 'unknown') if 'item' in locals() else 'unknown'
+            error_msg = f"Failed to retrieve channel data or transcripts. There was a technical error accessing YouTube for this URL: {str(e)}"
+            
+            logger.error(f"💥 Transcript worker {worker_id} error processing {url}: {e}")
+            # Add to failed URLs with clear messaging
+            analysis_results[job_id]['failed_urls'].append({
+                'url': url,
+                'error': error_msg,
+                'error_type': 'transcript_processing_error'
+            })
             transcript_queue.task_done()
 
 async def llm_worker(worker_id: int, llm_queue: asyncio.Queue, result_queue: asyncio.Queue,
@@ -1122,11 +1181,17 @@ async def llm_worker(worker_id: int, llm_queue: asyncio.Queue, result_queue: asy
         except asyncio.CancelledError:
             break
         except Exception as e:
-            logger.error(f"💥 LLM worker {worker_id} error processing {item.get('url', 'unknown')}: {e}")
-            # Add to failed URLs
+            url = item.get('url', 'unknown')
+            channel_name = item.get('channel_data', {}).get('channel_name', 'Unknown')
+            error_msg = f"Failed to analyze content with AI. Channel '{channel_name}' transcripts were retrieved successfully, but AI processing failed: {str(e)}"
+            
+            logger.error(f"💥 LLM worker {worker_id} error processing {url}: {e}")
+            # Add to failed URLs with clear messaging
             analysis_results[job_id]['failed_urls'].append({
-                'url': item.get('url', 'unknown'),
-                'error': str(e)
+                'url': url,
+                'error': error_msg,
+                'error_type': 'llm_processing_failed',
+                'channel_name': channel_name
             })
             llm_queue.task_done()
 

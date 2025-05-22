@@ -178,7 +178,7 @@ class YouTubeAnalyzer:
         except Exception as e:
             logger.error(f"Error extracting channel info: {str(e)}")
             return None
-            
+    
     def _get_videos_by_scraping(self, channel_id, limit):
         """Get videos by scraping channel page"""
         try:
