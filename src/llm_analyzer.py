@@ -8,7 +8,7 @@ import aiohttp
 import requests
 import pandas as pd
 import logging
-from typing import List, Dict, Any, Optional
+from typing import Dict, Any
 import asyncio
 
 logging.basicConfig(level=logging.INFO)

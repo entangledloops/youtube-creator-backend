@@ -3,14 +3,13 @@ FastAPI application for YouTube content compliance analysis
 """
 import os
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query, UploadFile, File, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Query, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from sse_starlette.sse import EventSourceResponse
 from pydantic import BaseModel, HttpUrl
 from typing import Optional, List, Dict, Any
 import logging
-import uvicorn
 import asyncio
 import pandas as pd
 import uuid
@@ -20,11 +19,10 @@ import time
 
 from src.youtube_analyzer import YouTubeAnalyzer
 from src.llm_analyzer import LLMAnalyzer
-from src.creator_processor import CreatorProcessor, ProcessingConfig
 
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO,  # Back to INFO
+    level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
