@@ -409,8 +409,18 @@ async def process_creator(url: str, video_limit: int, llm_provider: str, job_id:
             "summary": analysis_result.get('summary', {})
         })
         
-        # Store the complete result
-        analysis_results[job_id]['results'][str(url)] = analysis_result
+        # Store the complete result with transcript data
+        final_result = {
+            "url": str(url),
+            "channel_id": channel_data.get('channel_id', "unknown"),
+            "channel_name": channel_name or "Unknown",
+            "channel_handle": channel_handle or "Unknown",
+            "video_analyses": analysis_result.get('video_analyses', []),
+            "summary": analysis_result.get('summary', {}),
+            "original_videos": channel_data.get('videos', [])  # Store original video data with transcripts
+        }
+        
+        analysis_results[job_id]['results'][str(url)] = final_result
         analysis_results[job_id]['processed_urls'] += 1
         
     except Exception as e:
@@ -650,6 +660,81 @@ async def download_bulk_analysis_csv(job_id: str):
         media_type='text/csv',
         filename=filename
           )
+
+@app.get("/api/bulk-analyze/{job_id}/evidence")
+async def download_bulk_analysis_evidence(job_id: str):
+    """Download detailed evidence and transcripts as JSON"""
+    if job_id not in analysis_results:
+        raise HTTPException(status_code=404, detail="Job not found")
+        
+    job = analysis_results[job_id]
+    if job['status'] == 'processing':
+        raise HTTPException(status_code=400, detail="Analysis still in progress")
+    
+    # Build structured evidence data
+    evidence_data = {
+        "job_id": job_id,
+        "analysis_date": job.get('started_at'),
+        "completed_date": job.get('completed_at'),
+        "total_creators": len(job['results']),
+        "creators": []
+    }
+    
+    for creator_url, result in job['results'].items():
+        creator_data = {
+            "creator_url": creator_url,
+            "channel_name": result.get('channel_name', ''),
+            "channel_handle": result.get('channel_handle', ''),
+            "channel_id": result.get('channel_id', ''),
+            "videos": []
+        }
+        
+        for video_analysis in result.get('video_analyses', []):
+            video_data = {
+                "video_url": video_analysis.get('video_url', ''),
+                "video_title": video_analysis.get('video_title', ''),
+                "video_id": video_analysis.get('video_id', ''),
+                "transcript": "Transcript not available",  # Will be populated below
+                "violations": []
+            }
+            
+            # Get transcript from original videos data
+            video_id = video_analysis.get('video_id', '')
+            for original_video in result.get('original_videos', []):
+                if original_video.get('id') == video_id and original_video.get('transcript'):
+                    video_data["transcript"] = original_video['transcript']['full_text']
+                    break
+            
+            # Get analysis data
+            analysis = video_analysis.get('analysis', {})
+            
+            # Add violations with evidence
+            for category, violation_data in analysis.get('results', {}).items():
+                violation = {
+                    "category": category,
+                    "score": violation_data.get('score', 0),
+                    "justification": violation_data.get('justification', ''),
+                    "evidence": violation_data.get('evidence', [])
+                }
+                video_data["violations"].append(violation)
+            
+            creator_data["videos"].append(video_data)
+        
+        evidence_data["creators"].append(creator_data)
+    
+    # Return as streaming JSON response
+    json_str = json.dumps(evidence_data, indent=2, ensure_ascii=False)
+    
+    def generate():
+        yield json_str
+    
+    return StreamingResponse(
+        generate(), 
+        media_type='application/json',
+        headers={
+            "Content-Disposition": f"attachment; filename=evidence_{job_id}.json"
+        }
+    )
 
 async def process_creators_pipeline(job_id: str, urls: List[str], video_limit: int, llm_provider: str):
     """Queue-based pipeline with timing and concurrency monitoring"""
@@ -925,18 +1010,18 @@ async def result_worker(worker_id: int, result_queue: asyncio.Queue, timing_stat
             if not channel_name and channel_data.get('channel_id'):
                 channel_name = f"Channel {channel_data['channel_id']}"
             
-            # Store final result
+            # Store the complete result with transcript data
             final_result = {
-                "url": url,
+                "url": str(url),
                 "channel_id": channel_data.get('channel_id', "unknown"),
                 "channel_name": channel_name or "Unknown",
-                "channel_handle": channel_handle or "Unknown", 
+                "channel_handle": channel_handle or "Unknown",
                 "video_analyses": analysis_result.get('video_analyses', []),
                 "summary": analysis_result.get('summary', {}),
-                "status": "success"
+                "original_videos": channel_data.get('videos', [])  # Store original video data with transcripts
             }
             
-            analysis_results[job_id]['results'][url] = final_result
+            analysis_results[job_id]['results'][str(url)] = final_result
             
             result_time = time.time() - start_time
             logger.info(f"✅ Result Worker {worker_id}: Stored {url} in {result_time:.3f}s")
@@ -974,4 +1059,4 @@ async def monitor_pipeline(job_id: str, transcript_queue: asyncio.Queue, llm_que
         except asyncio.CancelledError:
             break
         except Exception as e:
-                          logger.error(f"💥 Monitor error: {e}")
+            logger.error(f"💥 Monitor error: {e}")

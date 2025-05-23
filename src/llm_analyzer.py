@@ -76,6 +76,12 @@ TASK: Evaluate the following YouTube video transcript against each content compl
 - 0.25-0.5: Minor or ambiguous instances
 - 0.75-1: Clear violations
 
+IMPORTANT LANGUAGE GUIDANCE:
+- Mild profanity, casual swearing, or occasional strong language in entertainment context should generally score 0.25 or lower
+- Only score higher for excessive, aggressive, or targeted offensive language
+- Consider the overall context and intent rather than isolated words
+- Comedy, entertainment, and casual conversation contexts should be evaluated more leniently
+
 VIDEO TITLE: {video_title}
 
 CONTENT COMPLIANCE CATEGORIES:
