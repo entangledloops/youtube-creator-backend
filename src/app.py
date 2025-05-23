@@ -24,7 +24,7 @@ from src.creator_processor import CreatorProcessor, ProcessingConfig
 
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.INFO,  # Back to INFO
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
@@ -558,6 +558,33 @@ async def get_bulk_analysis_status_alias(job_id: str):
     logger.info(f"Status alias request for job_id: {job_id}")
     return await get_bulk_analysis_status(job_id)
 
+async def get_bulk_analysis_status(job_id: str):
+    """Get basic status of a bulk analysis job"""
+    if job_id not in analysis_results:
+        raise HTTPException(status_code=404, detail="Job not found")
+        
+    job = analysis_results[job_id]
+    
+    # Calculate counts for status
+    successful_count = len(job['results'])
+    failed_count = len(job['failed_urls'])
+    total_processed = successful_count + failed_count
+    
+    return {
+        "job_id": job_id,
+        "status": job['status'],
+        "started_at": job['started_at'],
+        "completed_at": job.get('completed_at'),
+        "total_urls": job['total_urls'],
+        "processed_urls": job['processed_urls'],
+        "progress": {
+            "successful": successful_count,
+            "failed": failed_count,
+            "total_processed": total_processed,
+            "percentage": (total_processed / job['total_urls'] * 100) if job['total_urls'] > 0 else 0
+        }
+    }
+
 @app.get("/api/bulk-analyze/{job_id}/results")
 async def get_bulk_analysis_results(job_id: str):
     """Get detailed results of a bulk analysis job"""
@@ -619,8 +646,11 @@ async def download_bulk_analysis_csv(job_id: str):
     if job['status'] == 'processing':
         raise HTTPException(status_code=400, detail="Analysis still in progress")
         
-    # Get all categories
-    categories_df = pd.read_csv("../data/YouTube_Controversy_Categories.csv")
+    # Get all categories - fix the path to be relative to project root
+    src_dir = os.path.dirname(__file__)
+    project_root = os.path.dirname(src_dir)
+    categories_file = os.path.join(project_root, "data", "YouTube_Controversy_Categories.csv")
+    categories_df = pd.read_csv(categories_file)
     all_categories = categories_df['Category'].tolist()
         
     # Convert results to DataFrame
@@ -755,11 +785,17 @@ async def process_creators_pipeline(job_id: str, urls: List[str], video_limit: i
         llm_queue = asyncio.Queue(maxsize=1000)
         result_queue = asyncio.Queue(maxsize=1000)
         
-        # Timing tracking
+        # Enhanced timing and queue tracking
         timing_stats = {
             'transcript_times': [],
             'llm_times': [],
-            'total_times': []
+            'total_times': [],
+            'queue_depths': {
+                'transcript': [],
+                'llm': [],
+                'result': []
+            },
+            'timestamps': []
         }
         
         # Start all URLs processing immediately (true concurrency)
@@ -770,6 +806,16 @@ async def process_creators_pipeline(job_id: str, urls: List[str], video_limit: i
                 'video_limit': video_limit,
                 'start_time': time.time()
             })
+        
+        # Capture initial queue state
+        initial_transcript_size = transcript_queue.qsize()
+        logger.info(f"📊 Initial queue state: Transcript={initial_transcript_size}, LLM=0, Result=0")
+        
+        # Record initial queue depths
+        timing_stats['queue_depths']['transcript'].append(initial_transcript_size)
+        timing_stats['queue_depths']['llm'].append(0)
+        timing_stats['queue_depths']['result'].append(0)
+        timing_stats['timestamps'].append(time.time())
         
         # Start workers
         transcript_workers = []
@@ -797,9 +843,9 @@ async def process_creators_pipeline(job_id: str, urls: List[str], video_limit: i
             )
             result_workers.append(worker)
         
-        # Monitor progress and queue depths
+        # Monitor progress and queue depths with enhanced tracking
         monitor_task = asyncio.create_task(
-            monitor_pipeline(job_id, transcript_queue, llm_queue, result_queue, len(urls))
+            monitor_pipeline(job_id, transcript_queue, llm_queue, result_queue, len(urls), timing_stats)
         )
         
         # Wait for all work to complete
@@ -812,43 +858,107 @@ async def process_creators_pipeline(job_id: str, urls: List[str], video_limit: i
         logger.info("⏳ Waiting for all result work to complete...")
         await result_queue.join()
         
-        # Cancel workers
+        # Cancel workers and monitor
         for workers in [transcript_workers, llm_workers, result_workers]:
             for worker in workers:
                 worker.cancel()
         monitor_task.cancel()
         
-        # Calculate final statistics
+        # Wait a moment for final monitoring data
+        await asyncio.sleep(0.5)
+        
+        # Calculate comprehensive final statistics
         total_time = time.time() - start_time
         successful = len(analysis_results[job_id]['results'])
         failed = len(analysis_results[job_id]['failed_urls'])
         total_processed = successful + failed
         
         # Log comprehensive final statistics
-        logger.info("=" * 80)
+        logger.info("=" * 100)
         logger.info(f"🏁 FINAL STATISTICS for job {job_id}")
-        logger.info(f"📊 URLs submitted: {len(urls)}")
-        logger.info(f"📊 URLs processed: {total_processed}")
-        logger.info(f"✅ Successful: {successful}")
-        logger.info(f"❌ Failed: {failed}")
-        logger.info(f"⏱️  Total time: {total_time:.2f}s")
-        logger.info(f"🚀 Throughput: {total_processed/total_time:.2f} URLs/sec")
+        logger.info("=" * 100)
+        logger.info(f"📊 PROCESSING SUMMARY:")
+        logger.info(f"   └─ URLs submitted: {len(urls)}")
+        logger.info(f"   └─ URLs processed: {total_processed}")
+        logger.info(f"   └─ ✅ Successful: {successful}")
+        logger.info(f"   └─ ❌ Failed: {failed}")
+        logger.info(f"   └─ ⏱️  Total time: {total_time:.2f}s")
+        logger.info(f"   └─ 🚀 Throughput: {total_processed/total_time:.2f} URLs/sec")
         
-        # Timing percentiles
+        # Timing analysis
         if timing_stats['transcript_times']:
             transcript_times = sorted(timing_stats['transcript_times'])
-            logger.info(f"📈 Transcript times - P50: {transcript_times[len(transcript_times)//2]:.2f}s, P99: {transcript_times[int(len(transcript_times)*0.99)]:.2f}s")
+            transcript_p50 = transcript_times[len(transcript_times)//2]
+            transcript_p95 = transcript_times[int(len(transcript_times)*0.95)]
+            transcript_p99 = transcript_times[int(len(transcript_times)*0.99)]
+            logger.info(f"📈 TRANSCRIPT TIMING:")
+            logger.info(f"   └─ Count: {len(transcript_times)} operations")
+            logger.info(f"   └─ P50: {transcript_p50:.2f}s | P95: {transcript_p95:.2f}s | P99: {transcript_p99:.2f}s")
+            logger.info(f"   └─ Min: {min(transcript_times):.2f}s | Max: {max(transcript_times):.2f}s")
         
         if timing_stats['llm_times']:
             llm_times = sorted(timing_stats['llm_times'])
-            logger.info(f"📈 LLM times - P50: {llm_times[len(llm_times)//2]:.2f}s, P99: {llm_times[int(len(llm_times)*0.99)]:.2f}s")
+            llm_p50 = llm_times[len(llm_times)//2]
+            llm_p95 = llm_times[int(len(llm_times)*0.95)]
+            llm_p99 = llm_times[int(len(llm_times)*0.99)]
+            logger.info(f"🤖 LLM ANALYSIS TIMING:")
+            logger.info(f"   └─ Count: {len(llm_times)} operations")
+            logger.info(f"   └─ P50: {llm_p50:.2f}s | P95: {llm_p95:.2f}s | P99: {llm_p99:.2f}s")
+            logger.info(f"   └─ Min: {min(llm_times):.2f}s | Max: {max(llm_times):.2f}s")
+        
+        # Queue depth analysis for bottleneck identification
+        if timing_stats['queue_depths']['transcript']:
+            transcript_depths = timing_stats['queue_depths']['transcript']
+            llm_depths = timing_stats['queue_depths']['llm']
+            result_depths = timing_stats['queue_depths']['result']
+            
+            logger.info(f"📊 QUEUE DEPTH ANALYSIS:")
+            logger.info(f"   📋 Transcript Queue:")
+            logger.info(f"      └─ Avg: {sum(transcript_depths)/len(transcript_depths):.1f} | Max: {max(transcript_depths)} | Min: {min(transcript_depths)}")
+            logger.info(f"   🤖 LLM Queue:")
+            logger.info(f"      └─ Avg: {sum(llm_depths)/len(llm_depths):.1f} | Max: {max(llm_depths)} | Min: {min(llm_depths)}")
+            logger.info(f"   📝 Result Queue:")
+            logger.info(f"      └─ Avg: {sum(result_depths)/len(result_depths):.1f} | Max: {max(result_depths)} | Min: {min(result_depths)}")
+            
+            # Bottleneck analysis
+            avg_transcript = sum(transcript_depths)/len(transcript_depths) if transcript_depths else 0
+            avg_llm = sum(llm_depths)/len(llm_depths) if llm_depths else 0
+            avg_result = sum(result_depths)/len(result_depths) if result_depths else 0
+            
+            logger.info(f"🔍 BOTTLENECK ANALYSIS:")
+            if avg_transcript > max(avg_llm, avg_result) * 1.5:
+                logger.info(f"   └─ 🚨 TRANSCRIPT stage is the bottleneck (avg queue: {avg_transcript:.1f})")
+                logger.info(f"      └─ Consider adding more transcript workers or optimizing YouTube API calls")
+            elif avg_llm > max(avg_transcript, avg_result) * 1.5:
+                logger.info(f"   └─ 🚨 LLM stage is the bottleneck (avg queue: {avg_llm:.1f})")
+                logger.info(f"      └─ Consider adding more LLM workers or optimizing prompts")
+            elif avg_result > max(avg_transcript, avg_llm) * 1.5:
+                logger.info(f"   └─ 🚨 RESULT stage is the bottleneck (avg queue: {avg_result:.1f})")
+                logger.info(f"      └─ Consider adding more result workers")
+            else:
+                logger.info(f"   └─ ✅ No significant bottlenecks detected - balanced pipeline")
+        
+        # Error analysis
+        if failed > 0:
+            error_types = {}
+            for failed_url in analysis_results[job_id]['failed_urls']:
+                error_type = failed_url.get('error_type', 'unknown')
+                error_types[error_type] = error_types.get(error_type, 0) + 1
+            
+            logger.info(f"❌ ERROR ANALYSIS:")
+            for error_type, count in sorted(error_types.items(), key=lambda x: x[1], reverse=True):
+                logger.info(f"   └─ {error_type}: {count} failures")
         
         # Log any discrepancies
         if total_processed != len(urls):
-            logger.error(f"🚨 DISCREPANCY: Expected {len(urls)} URLs, processed {total_processed}")
-            logger.error(f"🚨 Missing: {len(urls) - total_processed} URLs")
+            logger.error(f"🚨 DISCREPANCY DETECTED:")
+            logger.error(f"   └─ Expected: {len(urls)} URLs")
+            logger.error(f"   └─ Processed: {total_processed} URLs")
+            logger.error(f"   └─ Missing: {len(urls) - total_processed} URLs")
+        else:
+            logger.info(f"✅ PROCESSING COMPLETE: All {len(urls)} URLs accounted for")
         
-        logger.info("=" * 80)
+        logger.info("=" * 100)
         
         # Mark job as complete
         analysis_results[job_id]['status'] = 'completed'
@@ -1035,11 +1145,20 @@ async def result_worker(worker_id: int, result_queue: asyncio.Queue, timing_stat
             result_queue.task_done()
 
 async def monitor_pipeline(job_id: str, transcript_queue: asyncio.Queue, llm_queue: asyncio.Queue, 
-                          result_queue: asyncio.Queue, total_urls: int):
-    """Monitor queue depths and progress"""
+                          result_queue: asyncio.Queue, total_urls: int, timing_stats: dict):
+    """Monitor queue depths and progress with enhanced tracking"""
+    monitor_start = time.time()
+    monitoring_interval = 3  # Monitor every 3 seconds for better granularity
+    last_detailed_log = 0
+    
+    logger.info(f"🔍 Starting enhanced pipeline monitoring for job {job_id}")
+    
     while True:
         try:
-            await asyncio.sleep(5)  # Monitor every 5 seconds
+            await asyncio.sleep(monitoring_interval)
+            
+            current_time = time.time()
+            elapsed = current_time - monitor_start
             
             transcript_size = transcript_queue.qsize()
             llm_size = llm_queue.qsize() 
@@ -1049,14 +1168,47 @@ async def monitor_pipeline(job_id: str, transcript_queue: asyncio.Queue, llm_que
             failed = len(analysis_results[job_id]['failed_urls'])
             processed = completed + failed
             
-            logger.info(f"📊 PIPELINE STATUS - Queues: T:{transcript_size} | L:{llm_size} | R:{result_size} | Progress: {processed}/{total_urls} ({processed/total_urls*100:.1f}%)")
+            # Always log basic status
+            progress_pct = (processed/total_urls*100) if total_urls > 0 else 0
+            logger.info(f"📊 T:{transcript_size:2d} | L:{llm_size:2d} | R:{result_size:2d} | {processed:3d}/{total_urls} ({progress_pct:5.1f}%) | {elapsed:6.1f}s elapsed")
+            
+            # Update queue depths for analysis
+            timing_stats['queue_depths']['transcript'].append(transcript_size)
+            timing_stats['queue_depths']['llm'].append(llm_size)
+            timing_stats['queue_depths']['result'].append(result_size)
+            timing_stats['timestamps'].append(current_time)
+            
+            # Detailed logging every 15 seconds
+            if elapsed - last_detailed_log >= 15:
+                last_detailed_log = elapsed
+                
+                if processed > 0:
+                    rate = processed / elapsed
+                    eta_seconds = (total_urls - processed) / rate if rate > 0 else 0
+                    eta_minutes = eta_seconds / 60
+                    
+                    # Debug current max values
+                    current_max_t = max(timing_stats['queue_depths']['transcript'], default=0)
+                    current_max_l = max(timing_stats['queue_depths']['llm'], default=0)
+                    current_max_r = max(timing_stats['queue_depths']['result'], default=0)
+                    
+                    logger.info(f"📈 DETAILED STATUS:")
+                    logger.info(f"   └─ Processing rate: {rate:.2f} URLs/sec")
+                    logger.info(f"   └─ ETA: {eta_minutes:.1f} minutes ({eta_seconds:.0f}s)")
+                    logger.info(f"   └─ Queue depths - Max seen: T:{current_max_t} | L:{current_max_l} | R:{current_max_r}")
+                    logger.info(f"   └─ Debug: Stats collected: {len(timing_stats['queue_depths']['transcript'])} data points")
+                    logger.info(f"   └─ Debug: Recent T depths={timing_stats['queue_depths']['transcript'][-5:]} (last 5)")
+                    logger.info(f"   └─ Debug: Recent L depths={timing_stats['queue_depths']['llm'][-5:]} (last 5)")
+                    logger.info(f"   └─ Debug: Recent R depths={timing_stats['queue_depths']['result'][-5:]} (last 5)")
             
             # If all work is done, break
             if processed >= total_urls and transcript_size == 0 and llm_size == 0 and result_size == 0:
                 logger.info("🏁 All work completed, stopping monitor")
+                logger.info(f"📊 Final monitoring stats: {len(timing_stats['queue_depths']['transcript'])} data points collected over {elapsed:.1f}s")
                 break
                 
         except asyncio.CancelledError:
+            logger.info("🔍 Pipeline monitor cancelled")
             break
         except Exception as e:
             logger.error(f"💥 Monitor error: {e}")

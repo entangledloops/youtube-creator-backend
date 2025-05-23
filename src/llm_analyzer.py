@@ -72,12 +72,18 @@ class LLMAnalyzer:
         base_prompt = f"""You are an objective content compliance analyzer.
 
 TASK: Evaluate the following YouTube video transcript against each content compliance category. For each category, provide a score from 0 to 1, where:
-- 0: No violation detected
-- 0.25-0.5: Minor or ambiguous instances
-- 0.75-1: Clear violations
+
+SCORING SCALE (use the full range):
+- 0.0: No violation detected
+- 0.1-0.3: Very minor instances or borderline content
+- 0.4-0.6: Moderate violations or clear but not severe instances  
+- 0.7-0.9: Significant violations or multiple instances
+- 1.0: Severe, egregious, or extreme violations
+
+Use precise decimal scores (e.g., 0.2, 0.5, 0.8) to reflect the exact severity level rather than just endpoint values.
 
 IMPORTANT LANGUAGE GUIDANCE:
-- Mild profanity, casual swearing, or occasional strong language in entertainment context should generally score 0.25 or lower
+- Mild profanity, casual swearing, or occasional strong language in entertainment context should generally score 0.3 or lower
 - Only score higher for excessive, aggressive, or targeted offensive language
 - Consider the overall context and intent rather than isolated words
 - Comedy, entertainment, and casual conversation contexts should be evaluated more leniently
@@ -92,7 +98,7 @@ PLACEHOLDER_FOR_TRANSCRIPT
 
 INSTRUCTIONS:
 1. For EACH category listed above, provide:
-   - Score (0-1)
+   - Score (0-1) - Use precise decimals based on severity
    - Brief justification
    - Quote any problematic text found
 
