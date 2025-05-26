@@ -10,6 +10,8 @@ from urllib.parse import urlparse, parse_qs
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
 import logging
 from typing import Dict, Any, Optional, Tuple
+import os
+import time
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -17,7 +19,18 @@ logger = logging.getLogger(__name__)
 class YouTubeAnalyzer:
     def __init__(self, youtube_api_key=None):
         self.youtube_api_key = youtube_api_key
-        self.semaphore = asyncio.Semaphore(5)  # Limit concurrent transcript fetches
+        
+        # Simple rate limiting to prevent IP blocking
+        self.max_concurrent_requests = int(os.getenv("YOUTUBE_MAX_CONCURRENT", "5"))  # Back to 5 concurrent
+        self.request_delay_seconds = float(os.getenv("YOUTUBE_REQUEST_DELAY", "0.5"))  # Just 0.5 second delay
+        
+        self.semaphore = asyncio.Semaphore(self.max_concurrent_requests)
+        self.last_request_time = 0
+        self.rate_limit_lock = asyncio.Lock()
+        
+        logger.info(f"🚦 YouTube Rate Limiting Config:")
+        logger.info(f"   └─ Max concurrent requests: {self.max_concurrent_requests}")
+        logger.info(f"   └─ Delay between transcript requests: {self.request_delay_seconds}s")
         
     def extract_channel_info_from_url(self, url):
         """Extract channel ID, name, and handle from a YouTube URL"""
@@ -294,9 +307,24 @@ class YouTubeAnalyzer:
         return videos
     
     async def get_transcript_async(self, video_id: str) -> Optional[Dict[str, Any]]:
-        """Get transcript for a YouTube video asynchronously with rate limiting"""
-        async with self.semaphore:  # Rate limiting
+        """Get transcript for a YouTube video asynchronously with simple rate limiting"""
+        async with self.semaphore:  # Limit concurrent requests
+            # Simple rate limiting to prevent IP blocking
+            async with self.rate_limit_lock:
+                current_time = time.time()
+                
+                # Ensure minimum delay between requests
+                time_since_last = current_time - self.last_request_time
+                if time_since_last < self.request_delay_seconds:
+                    sleep_time = self.request_delay_seconds - time_since_last
+                    logger.debug(f"⏱️  Rate limiting: sleeping {sleep_time:.1f}s before transcript request for {video_id}")
+                    await asyncio.sleep(sleep_time)
+                
+                self.last_request_time = time.time()
+            
             try:
+                logger.debug(f"🎬 Fetching transcript for video {video_id}")
+                
                 # Use aiohttp for async HTTP requests
                 async with aiohttp.ClientSession() as session:
                     # Get transcript data - support multiple languages
@@ -319,6 +347,8 @@ class YouTubeAnalyzer:
                         
                     # Create full text from transcript segments
                     full_text = ' '.join([entry.get('text', '') for entry in transcript_data])
+                    
+                    logger.debug(f"✅ Successfully fetched transcript for {video_id} ({len(full_text)} chars)")
                     
                     return {
                         'full_text': full_text,

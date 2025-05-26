@@ -611,4 +611,31 @@ INSTRUCTIONS:
             
         except Exception as e:
             logger.error(f"Error analyzing channel content: {str(e)}")
-            raise 
+            raise
+
+    async def analyze_video_content_async(self, video_data):
+        """Analyze content from a single video using async processing"""
+        try:
+            if not video_data.get('transcript'):
+                return {
+                    "video_id": video_data.get('id', 'unknown'),
+                    "message": "No transcript available for this video.",
+                    "results": {}
+                }
+            
+            # Analyze the video
+            analysis = await self.analyze_transcript_async(
+                transcript_text=video_data['transcript']['full_text'],
+                video_title=video_data.get('title', 'Unknown Title'),
+                video_id=video_data.get('id', 'unknown')
+            )
+            
+            return analysis
+            
+        except Exception as e:
+            logger.error(f"Error analyzing video content: {str(e)}")
+            return {
+                "video_id": video_data.get('id', 'unknown'),
+                "error": str(e),
+                "results": {}
+            } 
