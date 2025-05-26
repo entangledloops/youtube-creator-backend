@@ -1174,6 +1174,49 @@ async def download_bulk_analysis_evidence(job_id: str):
         }
     )
 
+@app.get("/api/bulk-analyze/{job_id}/failed-csv")
+async def download_failed_urls_csv(job_id: str):
+    """Download failed URLs from bulk analysis as CSV"""
+    if job_id not in analysis_results:
+        raise HTTPException(status_code=404, detail="Job not found")
+        
+    job = analysis_results[job_id]
+    
+    # Allow CSV download for any completed job (including cancelled)
+    if job['status'] == 'processing':
+        raise HTTPException(status_code=400, detail="Analysis still in progress")
+    
+    # Check if we have any failed URLs
+    failed_urls = job.get('failed_urls', [])
+    if not failed_urls:
+        raise HTTPException(status_code=404, detail="No failed URLs to download")
+    
+    # Convert failed URLs to DataFrame
+    rows = []
+    for failed_item in failed_urls:
+        row = {
+            'url': failed_item.get('url', ''),
+            'error_type': failed_item.get('error_type', 'unknown'),
+            'error_message': failed_item.get('error', ''),
+            'channel_name': failed_item.get('channel_name', ''),
+            'video_id': failed_item.get('video_id', ''),
+            'video_count': failed_item.get('video_count', '')
+        }
+        rows.append(row)
+        
+    df = pd.DataFrame(rows)
+    
+    # Add metadata for cancelled jobs
+    filename_suffix = "_partial" if job['status'] == 'cancelled' else ""
+    filename = f"failed_urls_{job_id}{filename_suffix}.csv"
+    df.to_csv(filename, index=False)
+    
+    return FileResponse(
+        filename,
+        media_type='text/csv',
+        filename=filename
+    )
+
 async def process_creators_pipeline(job_id: str, urls: List[str], video_limit: int, llm_provider: str):
     """Queue-based pipeline with proper video-level rate limiting"""
     start_time = time.time()
