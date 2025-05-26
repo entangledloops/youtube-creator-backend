@@ -15,6 +15,9 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class LLMAnalyzer:
+    # Configuration constants
+    MIN_VIOLATION_SCORE = 0.0  # Minimum score to consider a violation serious enough to report
+    
     def __init__(self, provider="local", categories_file=None):
         """
         Initialize LLM analyzer with specified provider
@@ -69,24 +72,34 @@ class LLMAnalyzer:
         categories = self._prepare_categories_prompt()
         
         # Calculate rough prompt size without transcript
-        base_prompt = f"""You are an objective content compliance analyzer.
+        base_prompt = f"""You are a content compliance analyzer focused on identifying BLATANT and SERIOUS violations only.
+
+CRITICAL INSTRUCTIONS: You are looking for CLEAR, OBVIOUS, and SERIOUS violations. Be very conservative in your scoring. When in doubt, score lower or don't include the category at all.
 
 TASK: Evaluate the following YouTube video transcript against each content compliance category. For each category, provide a score from 0 to 1, where:
 
-SCORING SCALE (use the full range):
+SCORING SCALE (BE VERY CONSERVATIVE):
 - 0.0: No violation detected
-- 0.1-0.3: Very minor instances or borderline content
-- 0.4-0.6: Moderate violations or clear but not severe instances  
-- 0.7-0.9: Significant violations or multiple instances
-- 1.0: Severe, egregious, or extreme violations
+- 0.1-0.2: Very minor instances that barely qualify as violations
+- 0.3-0.5: Clear violations that are moderate in severity
+- 0.6-0.8: Serious, repeated, or clearly harmful violations
+- 0.9-1.0: Extreme, dangerous, or egregious violations only
 
-Use precise decimal scores (e.g., 0.2, 0.5, 0.8) to reflect the exact severity level rather than just endpoint values.
+STRICT EVALUATION CRITERIA:
+- IGNORE casual profanity, mild language, entertainment banter, comedy content, and normal social conversation
+- IGNORE single instances of borderline content - look for patterns or severity
+- ONLY flag content that is clearly harmful, dangerous, illegal, or extremely inappropriate
+- Consider the INTENT and CONTEXT - educational, entertainment, and casual discussion should be scored very leniently
+- For language violations: Only flag excessive, aggressive, hateful, or targeted offensive language
+- For violence/harm: Only flag content that actively promotes or instructs dangerous behavior
+- For adult content: Only flag explicit sexual content, not mild suggestive themes
+- For illegal activities: Only flag clear promotion or instruction of illegal acts
 
-IMPORTANT LANGUAGE GUIDANCE:
-- Mild profanity, casual swearing, or occasional strong language in entertainment context should generally score 0.3 or lower
-- Only score higher for excessive, aggressive, or targeted offensive language
-- Consider the overall context and intent rather than isolated words
-- Comedy, entertainment, and casual conversation contexts should be evaluated more leniently
+CONTENT TOLERANCE:
+- Normal YouTube entertainment content should rarely score above 0.2
+- Comedy, gaming, vlogging, lifestyle content should be evaluated very leniently  
+- Educational content discussing sensitive topics should not be penalized
+- Reaction videos, commentary, and discussion should not be penalized for mentioning topics
 
 VIDEO TITLE: {video_title}
 
@@ -97,24 +110,25 @@ TRANSCRIPT:
 PLACEHOLDER_FOR_TRANSCRIPT
 
 INSTRUCTIONS:
-1. For EACH category listed above, provide:
-   - Score (0-1) - Use precise decimals based on severity
-   - Brief justification
-   - Quote any problematic text found
+1. For EACH category listed above, provide a score ONLY if there are CLEAR, SERIOUS violations:
+   - Score (0-1) - Be conservative, when in doubt score lower or exclude
+   - Brief justification explaining why this is a serious violation
+   - Quote the most problematic text found
 
 2. Your response MUST be a valid JSON object with this structure:
 {{
   "Category Name": {{
     "score": 0.5,
-    "justification": "Reason for score",
-    "evidence": ["quote1", "quote2"]
+    "justification": "Reason why this is a serious violation",
+    "evidence": ["clear problematic quote1", "clear problematic quote2"]
   }}
 }}
 
-3. Only include categories where you found potential violations (score > 0).
-4. If no violations found for a category, don't include it.
-5. If no violations found at all, return an empty JSON object: {{}}
+3. ONLY include categories where you found SERIOUS violations (score > 0.2).
+4. If content is borderline, educational, entertainment, or minor, DO NOT include it.
+5. If no serious violations found at all, return an empty JSON object: {{}}
 6. Ensure all JSON is properly formatted with double quotes around keys and string values.
+7. REMEMBER: It's better to miss minor violations than to flag normal content. Be conservative.
 """
         
         # Estimate tokens used by base prompt (roughly 4 chars per token)
@@ -252,10 +266,10 @@ INSTRUCTIONS:
                 # Extract valid JSON
                 analysis_results = self._extract_valid_json(content)
                 
-                # Filter out categories with score=0
+                # Filter out categories with low scores - only serious violations (>0.2)
                 analysis_results = {
                     category: data for category, data in analysis_results.items()
-                    if data.get('score', 0) > 0
+                    if data.get('score', 0) > self.MIN_VIOLATION_SCORE
                 }
                 
                 return {
@@ -331,10 +345,10 @@ INSTRUCTIONS:
                 # Extract valid JSON
                 analysis_results = self._extract_valid_json(content)
                 
-                # Filter out categories with score=0
+                # Filter out categories with low scores - only serious violations (>0.2)
                 analysis_results = {
                     category: data for category, data in analysis_results.items()
-                    if data.get('score', 0) > 0
+                    if data.get('score', 0) > self.MIN_VIOLATION_SCORE
                 }
                 
                 return {
@@ -397,10 +411,10 @@ INSTRUCTIONS:
                             # Extract valid JSON
                             analysis_results = self._extract_valid_json(content)
                             
-                            # Filter out categories with score=0
+                            # Filter out categories with low scores - only serious violations (>0.2)
                             analysis_results = {
                                 category: data for category, data in analysis_results.items()
-                                if data.get('score', 0) > 0
+                                if data.get('score', 0) > self.MIN_VIOLATION_SCORE
                             }
                             
                             return {

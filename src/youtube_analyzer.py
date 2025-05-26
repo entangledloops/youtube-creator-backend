@@ -299,11 +299,19 @@ class YouTubeAnalyzer:
             try:
                 # Use aiohttp for async HTTP requests
                 async with aiohttp.ClientSession() as session:
-                    # Get transcript data
+                    # Get transcript data - support multiple languages
                     transcript_data = await asyncio.to_thread(
                         YouTubeTranscriptApi.get_transcript,
                         video_id,
-                        languages=['en', 'en-US', 'en-GB']
+                        languages=[
+                            'en', 'en-US', 'en-GB',  # English variants
+                            'de', 'de-DE',            # German
+                            'fr', 'fr-FR',            # French  
+                            'it', 'it-IT',            # Italian
+                            'sv', 'sv-SE',            # Swedish
+                            'es', 'es-ES', 'es-MX',   # Spanish (Spain and Mexico)
+                            'nl', 'nl-NL'             # Dutch
+                        ]
                     )
                     
                     if not transcript_data:
