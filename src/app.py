@@ -580,14 +580,16 @@ async def bulk_analyze(
             
             # Detailed pipeline stage tracking
             'pipeline_stages': {
-                'queued_for_transcripts': len(cleaned_urls),  # URLs waiting to start transcript fetch
-                'fetching_transcripts': 0,                   # URLs currently pulling transcripts
-                'queued_for_llm': 0,                        # URLs waiting for LLM analysis
-                'llm_processing': 0,                        # URLs currently being analyzed by LLM
-                'queued_for_results': 0,                    # URLs waiting for result processing
-                'result_processing': 0,                     # URLs being processed into final results
-                'completed': 0,                             # Successfully completed URLs
-                'failed': 0                                 # Failed URLs
+                'queued_for_discovery': len(cleaned_urls),   # Channels waiting for video discovery
+                'discovering_videos': 0,                     # Channels currently being processed for video discovery
+                'queued_for_transcripts': 0,                 # Individual videos waiting for transcript fetch
+                'fetching_transcripts': 0,                   # Individual videos currently being transcript fetched
+                'queued_for_llm': 0,                        # Videos with transcripts waiting for LLM analysis
+                'llm_processing': 0,                        # Videos currently being analyzed by LLM
+                'queued_for_results': 0,                    # LLM results waiting for aggregation
+                'result_processing': 0,                     # Results being processed into final format
+                'completed': 0,                             # Successfully completed videos
+                'failed': 0                                 # Failed videos/channels
             },
             
             # Performance tracking for ETA calculation
@@ -767,11 +769,19 @@ async def get_bulk_analysis_status(job_id: str):
         video_progress_percentage = (videos_completed / total_videos) * 100
         effective_processed = videos_completed
         effective_total = total_videos
+        
+        # Channel progress should never exceed video progress
+        # Use video completion rate as a proxy for channel completion
+        channel_progress_percentage = video_progress_percentage
     else:
-        # Fallback to channel-level progress
+        # Fallback to channel-level progress when no video data available
         video_progress_percentage = (total_processed / job['total_urls'] * 100) if job['total_urls'] > 0 else 0
+        channel_progress_percentage = video_progress_percentage
         effective_processed = total_processed
         effective_total = job['total_urls']
+    
+    # Calculate channel-level progress (separate from video progress)
+    channel_progress_percentage = (total_processed / job['total_urls'] * 100) if job['total_urls'] > 0 else 0
     
     # Calculate ETA if job is processing
     eta_info = {}
@@ -827,7 +837,7 @@ async def get_bulk_analysis_status(job_id: str):
             "successful": successful_count,
             "failed": failed_count,
             "total_processed": total_processed,
-            "percentage": video_progress_percentage
+            "percentage": channel_progress_percentage
         },
         
         # Video-level progress details
@@ -859,7 +869,7 @@ async def get_bulk_analysis_status(job_id: str):
         }
     
     # DEBUG: Log what we're sending to frontend
-    logger.info(f"   📤 Sending to frontend - Progress: {response['progress']['percentage']:.1f}%")
+    logger.info(f"   📤 Sending to frontend - Channel Progress: {channel_progress_percentage:.1f}%, Video Progress: {video_progress_percentage:.1f}%")
     logger.info(f"   📤 Pipeline stages being sent: {response['pipeline_stages']}")
     
     return response
@@ -1170,7 +1180,7 @@ async def process_creators_pipeline(job_id: str, urls: List[str], video_limit: i
     
     try:
         logger.info(f"🚀 Starting pipeline for job {job_id} with {len(urls)} URLs")
-        logger.info(f"⚖️ Using 8 channel discovery workers, 5 transcript workers, 10 LLM workers")
+        logger.info(f"⚖️ Using 8 discovery workers, 5 transcript workers, 10 LLM workers")
         
         # Always use environment LLM_PROVIDER (ignore any frontend input)
         actual_llm_provider = os.getenv("LLM_PROVIDER", "local")
@@ -1239,14 +1249,14 @@ async def process_creators_pipeline(job_id: str, urls: List[str], video_limit: i
             )
             video_workers.append(worker)
         
-        # 10 LLM workers 
+        # 10 LLM workers (process individual video transcripts)
         for i in range(10):
             worker = asyncio.create_task(
                 llm_worker(i, llm_queue, result_queue, llm_analyzer, timing_stats, job_id)
             )
             llm_workers.append(worker)
         
-        # 5 result workers
+        # 5 result workers (aggregate video results by channel)
         for i in range(5):
             worker = asyncio.create_task(
                 result_worker(i, result_queue, timing_stats, job_id)
@@ -1341,9 +1351,9 @@ async def process_creators_pipeline(job_id: str, urls: List[str], video_limit: i
             result_depths = timing_stats['queue_depths']['result']
             
             logger.info(f"📊 QUEUE DEPTH ANALYSIS:")
-            logger.info(f"   📋 Channel Queue:")
+            logger.info(f"   📋 Discovery Queue:")
             logger.info(f"      └─ Avg: {sum(channel_depths)/len(channel_depths):.1f} | Max: {max(channel_depths)} | Min: {min(channel_depths)}")
-            logger.info(f"   🎬 Video Queue:")
+            logger.info(f"   🎬 Transcript Queue:")
             logger.info(f"      └─ Avg: {sum(video_depths)/len(video_depths):.1f} | Max: {max(video_depths)} | Min: {min(video_depths)}")
             logger.info(f"   🤖 LLM Queue:")
             logger.info(f"      └─ Avg: {sum(llm_depths)/len(llm_depths):.1f} | Max: {max(llm_depths)} | Min: {min(llm_depths)}")
@@ -1359,7 +1369,7 @@ async def process_creators_pipeline(job_id: str, urls: List[str], video_limit: i
             logger.info(f"🔍 BOTTLENECK ANALYSIS:")
             max_avg = max(avg_channel, avg_video, avg_llm, avg_result)
             if avg_video > max(avg_channel, avg_llm, avg_result) * 1.5:
-                logger.info(f"   └─ 🚨 VIDEO TRANSCRIPT stage is the bottleneck (avg queue: {avg_video:.1f})")
+                logger.info(f"   └─ 🚨 TRANSCRIPT stage is the bottleneck (avg queue: {avg_video:.1f})")
                 logger.info(f"      └─ Consider adding more video transcript workers or reducing rate limiting")
             elif avg_llm > max(avg_channel, avg_video, avg_result) * 1.5:
                 logger.info(f"   └─ 🚨 LLM stage is the bottleneck (avg queue: {avg_llm:.1f})")
@@ -1495,7 +1505,7 @@ async def channel_discovery_worker(worker_id: int, channel_queue: asyncio.Queue,
             start_time = time.time()
             
             # Update pipeline stage: queued -> fetching
-            update_pipeline_stage(job_id, 'queued_for_transcripts', 'fetching_transcripts')
+            update_pipeline_stage(job_id, 'queued_for_discovery', 'discovering_videos')
             
             logger.info(f"📋 Channel Worker {worker_id}: Discovering videos for {url}")
             
@@ -1507,7 +1517,7 @@ async def channel_discovery_worker(worker_id: int, channel_queue: asyncio.Queue,
                 logger.warning(f"❌ Channel Worker {worker_id}: Invalid channel URL - {url}")
                 
                 # Update pipeline stage: fetching -> failed
-                update_pipeline_stage(job_id, 'fetching_transcripts', 'failed')
+                update_pipeline_stage(job_id, 'discovering_videos', 'failed')
                 
                 analysis_results[job_id]['failed_urls'].append({
                     'url': url,
@@ -1523,7 +1533,7 @@ async def channel_discovery_worker(worker_id: int, channel_queue: asyncio.Queue,
                     logger.warning(f"❌ Channel Worker {worker_id}: No videos found for {url}")
                     
                     # Update pipeline stage: fetching -> failed
-                    update_pipeline_stage(job_id, 'fetching_transcripts', 'failed')
+                    update_pipeline_stage(job_id, 'discovering_videos', 'failed')
                     
                     analysis_results[job_id]['failed_urls'].append({
                         'url': url,
@@ -1540,7 +1550,7 @@ async def channel_discovery_worker(worker_id: int, channel_queue: asyncio.Queue,
                     # Add each video to video queue for transcript processing
                     for video in videos:
                         # Update pipeline stage: fetching -> queued for transcripts
-                        update_pipeline_stage(job_id, 'fetching_transcripts', 'queued_for_llm')
+                        update_pipeline_stage(job_id, 'discovering_videos', 'queued_for_transcripts')
                         
                         # Update video discovery count
                         analysis_results[job_id]['video_progress']['total_videos_discovered'] += 1
@@ -1567,7 +1577,7 @@ async def channel_discovery_worker(worker_id: int, channel_queue: asyncio.Queue,
             logger.error(f"💥 Channel discovery worker {worker_id} error processing {url}: {e}")
             
             # Update pipeline stage: fetching -> failed
-            update_pipeline_stage(job_id, 'fetching_transcripts', 'failed')
+            update_pipeline_stage(job_id, 'discovering_videos', 'failed')
             
             # Add to failed URLs with clear messaging
             analysis_results[job_id]['failed_urls'].append({
@@ -1592,6 +1602,9 @@ async def video_transcript_worker(worker_id: int, video_queue: asyncio.Queue, ll
             video_id = item['video_id']
             start_time = time.time()
             
+            # Update pipeline stage: queued for transcripts -> fetching transcripts
+            update_pipeline_stage(job_id, 'queued_for_transcripts', 'fetching_transcripts')
+            
             logger.info(f"🎬 Video Worker {worker_id}: Fetching transcript for video {video_id}")
             
             # Fetch transcript for this individual video (rate-limited globally)
@@ -1606,8 +1619,8 @@ async def video_transcript_worker(worker_id: int, video_queue: asyncio.Queue, ll
                 # Update video progress tracking
                 analysis_results[job_id]['video_progress']['videos_with_transcripts'] += 1
                 
-                # Update pipeline stage: transcript fetched -> queued for LLM
-                update_pipeline_stage(job_id, 'queued_for_llm', 'llm_processing')
+                # Update pipeline stage: fetching transcripts -> queued for LLM
+                update_pipeline_stage(job_id, 'fetching_transcripts', 'queued_for_llm')
                 
                 # Pass to LLM queue
                 await llm_queue.put({
@@ -1623,6 +1636,8 @@ async def video_transcript_worker(worker_id: int, video_queue: asyncio.Queue, ll
                 })
             else:
                 logger.warning(f"❌ Video Worker {worker_id}: No transcript available for video {video_id}")
+                # Update pipeline stage: fetching transcripts -> failed (for this video)
+                update_pipeline_stage(job_id, 'fetching_transcripts', 'failed')
                 # Don't count this as a failure since we got some videos from the channel
             
             video_queue.task_done()
@@ -1831,7 +1846,7 @@ async def monitor_pipeline_detailed(job_id: str, channel_queue: asyncio.Queue, v
             
             # Always log basic status
             progress_pct = (processed/total_urls*100) if total_urls > 0 else 0
-            logger.info(f"📊 T:{channel_size:2d} | V:{video_size:2d} | L:{llm_size:2d} | R:{result_size:2d} | {processed:3d}/{total_urls} ({progress_pct:5.1f}%) | {elapsed:6.1f}s elapsed")
+            logger.info(f"📊 D:{channel_size:2d} | T:{video_size:2d} | L:{llm_size:2d} | R:{result_size:2d} | {processed:3d}/{total_urls} ({progress_pct:5.1f}%) | {elapsed:6.1f}s elapsed")
             
             # Update queue depths for analysis
             timing_stats['queue_depths']['channel'].append(channel_size)
@@ -1858,10 +1873,10 @@ async def monitor_pipeline_detailed(job_id: str, channel_queue: asyncio.Queue, v
                     logger.info(f"📈 DETAILED STATUS:")
                     logger.info(f"   └─ Processing rate: {rate:.2f} URLs/sec")
                     logger.info(f"   └─ ETA: {eta_minutes:.1f} minutes ({eta_seconds:.0f}s)")
-                    logger.info(f"   └─ Queue depths - Max seen: C:{current_max_c} | V:{current_max_v} | L:{current_max_l} | R:{current_max_r}")
+                    logger.info(f"   └─ Queue depths - Max seen: D:{current_max_c} | T:{current_max_v} | L:{current_max_l} | R:{current_max_r}")
                     logger.info(f"   └─ Debug: Stats collected: {len(timing_stats['queue_depths']['channel'])} data points")
-                    logger.info(f"   └─ Debug: Recent C depths={timing_stats['queue_depths']['channel'][-5:]} (last 5)")
-                    logger.info(f"   └─ Debug: Recent V depths={timing_stats['queue_depths']['video'][-5:]} (last 5)")
+                    logger.info(f"   └─ Debug: Recent D depths={timing_stats['queue_depths']['channel'][-5:]} (last 5)")
+                    logger.info(f"   └─ Debug: Recent T depths={timing_stats['queue_depths']['video'][-5:]} (last 5)")
                     logger.info(f"   └─ Debug: Recent L depths={timing_stats['queue_depths']['llm'][-5:]} (last 5)")
                     logger.info(f"   └─ Debug: Recent R depths={timing_stats['queue_depths']['result'][-5:]} (last 5)")
             
