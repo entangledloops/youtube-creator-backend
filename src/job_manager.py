@@ -204,6 +204,25 @@ async def create_channel_summaries(job_id: str, analysis_results: dict):
         categories_df = pd.read_csv(categories_file)
         all_categories = categories_df['Category'].tolist()
         
+        # First, check for controversy failures that didn't make it to results
+        controversy_failures = analysis_results[job_id].get('controversy_check_failures', {})
+        for url, controversy_info in controversy_failures.items():
+            # Check if this URL made it to results
+            if url not in analysis_results[job_id]['results']:
+                # This controversial channel didn't make it to results - add to failed URLs
+                logger.warning(f"⚠️ Controversial channel {url} has no results - adding to failed URLs")
+                
+                # Check if it's already in failed_urls to avoid duplicates
+                already_failed = any(f['url'] == url for f in analysis_results[job_id]['failed_urls'])
+                if not already_failed:
+                    analysis_results[job_id]['failed_urls'].append({
+                        'url': url,
+                        'error': f"Channel flagged for controversy: {controversy_info.get('reason', 'Unknown reason')}. No videos could be analyzed.",
+                        'error_type': 'controversy_flagged_no_results',
+                        'channel_name': controversy_info.get('channel_name', 'Unknown'),
+                        'controversy_reason': controversy_info.get('reason', 'Unknown reason')
+                    })
+        
         # Process each channel's video results
         channels_to_remove = []  # Track channels that should be moved to failed
         
@@ -215,14 +234,27 @@ async def create_channel_summaries(job_id: str, analysis_results: dict):
                 # No videos were successfully analyzed - this is a failure
                 logger.warning(f"❌ Channel {url} has no successfully analyzed videos - moving to failed")
                 
+                # Check if this was a controversial channel
+                is_controversial = channel_data.get('controversy_flagged', False)
+                controversy_reason = channel_data.get('controversy_reason', None)
+                
+                if is_controversial:
+                    error_msg = f"Channel flagged for controversy: {controversy_reason}. Additionally, no videos could be analyzed."
+                    error_type = 'controversy_flagged_no_videos'
+                else:
+                    error_msg = 'Failed to analyze any videos from this channel. All transcript downloads may have failed.'
+                    error_type = 'no_videos_analyzed'
+                
                 # Add to failed URLs
                 analysis_results[job_id]['failed_urls'].append({
                     'url': url,
-                    'error': 'Failed to analyze any videos from this channel. All transcript downloads may have failed.',
-                    'error_type': 'no_videos_analyzed',
+                    'error': error_msg,
+                    'error_type': error_type,
                     'channel_name': channel_data.get('channel_name', 'Unknown'),
                     'channel_id': channel_data.get('channel_id', 'unknown'),
-                    'video_count': len(channel_data.get('original_videos', []))
+                    'video_count': len(channel_data.get('original_videos', [])),
+                    'controversy_flagged': is_controversial,
+                    'controversy_reason': controversy_reason
                 })
                 
                 # Mark for removal from results

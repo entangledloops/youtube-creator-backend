@@ -138,14 +138,14 @@ async def channel_discovery_worker(worker_id: int, channel_queue: asyncio.Queue,
 
 async def controversy_screening_worker(worker_id: int, controversy_queue: asyncio.Queue, video_queue: asyncio.Queue,
                                       llm_analyzer, timing_stats: dict, job_id: str, analysis_results: dict):
-    """Worker that screens channels for controversies before processing videos"""
+    """Worker that screens channels for controversy before processing videos"""
     while True:
         try:
             # Check if job is cancelled
             if is_job_cancelled(job_id, analysis_results):
-                logger.info(f"🔍 Controversy Worker {worker_id}: Job {job_id} cancelled, stopping...")
+                logger.info(f"⚠️ Controversy Worker {worker_id}: Job {job_id} cancelled, stopping...")
                 break
-                
+            
             # Get work item
             item = await controversy_queue.get()
             url = item['url']
@@ -155,10 +155,10 @@ async def controversy_screening_worker(worker_id: int, controversy_queue: asynci
             videos = item['videos']
             start_time = time.time()
             
-            # Update pipeline stage: queued for controversy -> screening
+            # Update pipeline stage: queued for controversy -> screening controversy
             update_pipeline_stage(job_id, 'queued_for_controversy', 'screening_controversy', analysis_results=analysis_results)
             
-            logger.debug(f"🔍 Controversy Worker {worker_id}: Screening {channel_name} for controversies")
+            logger.debug(f"⚠️ Controversy Worker {worker_id}: Screening {channel_name} for controversies")
             
             # Screen for controversies
             is_controversial, controversy_reason = await screen_creator_for_controversy(
@@ -173,19 +173,38 @@ async def controversy_screening_worker(worker_id: int, controversy_queue: asynci
             if is_controversial:
                 logger.warning(f"🚫 Controversy Worker {worker_id}: Creator {channel_name} flagged for controversy: {controversy_reason}")
                 
-                # Update pipeline stage: screening -> failed
-                update_pipeline_stage(job_id, 'screening_controversy', 'failed', analysis_results=analysis_results)
+                # Update pipeline stage: screening -> controversy check failed
+                update_pipeline_stage(job_id, 'screening_controversy', 'controversy_check_failed', analysis_results=analysis_results)
                 
-                # Add to failed URLs with high controversy score
-                analysis_results[job_id]['failed_urls'].append({
-                    'url': url,
-                    'error': f"Creator flagged for ongoing controversy: {controversy_reason}",
-                    'error_type': 'controversy_flagged',
-                    'channel_name': channel_name or 'Unknown',
-                    'channel_id': channel_id,
-                    'controversy_score': 1.0,  # Maximum controversy score
-                    'controversy_reason': controversy_reason
-                })
+                # Add to controversy check failures
+                if url not in analysis_results[job_id].get('controversy_check_failures', {}):
+                    if 'controversy_check_failures' not in analysis_results[job_id]:
+                        analysis_results[job_id]['controversy_check_failures'] = {}
+                    analysis_results[job_id]['controversy_check_failures'][url] = {
+                        'channel_name': channel_name,
+                        'reason': controversy_reason,
+                        'timestamp': datetime.now().isoformat()
+                    }
+                
+                # Still queue the videos for processing despite controversy
+                for video in videos:
+                    # Update pipeline stage: screening -> queued for transcripts
+                    update_pipeline_stage(job_id, 'screening_controversy', 'queued_for_transcripts', analysis_results=analysis_results)
+                    
+                    # Update video discovery count
+                    analysis_results[job_id]['video_progress']['total_videos_discovered'] += 1
+                    
+                    await video_queue.put({
+                        'url': url,
+                        'video_id': video['id'],
+                        'video_title': video['title'],
+                        'video_url': video['url'],
+                        'channel_id': channel_id,
+                        'channel_name': channel_name,
+                        'channel_handle': channel_handle,
+                        'start_time': time.time(),
+                        'controversy_check_failed': True  # Flag that controversy check failed
+                    })
             else:
                 logger.debug(f"✅ Controversy Worker {worker_id}: {channel_name} passed controversy screening in {screening_time:.2f}s")
                 
@@ -363,7 +382,8 @@ async def video_transcript_worker(worker_id: int, video_queue: asyncio.Queue, ll
                         'channel_id': item['channel_id'],
                         'channel_name': item['channel_name'],
                         'channel_handle': item['channel_handle'],
-                        'start_time': time.time()
+                        'start_time': time.time(),
+                        'controversy_check_failed': item.get('controversy_check_failed', False)  # Pass the flag
                     })
             else:
                 logger.debug(f"❌ Video Worker {worker_id}: No transcript available for video {video_id}")
@@ -435,7 +455,8 @@ async def llm_worker(worker_id: int, llm_queue: asyncio.Queue, result_queue: asy
                 'channel_id': item['channel_id'],
                 'channel_name': item['channel_name'],
                 'channel_handle': item['channel_handle'],
-                'start_time': time.time()
+                'start_time': time.time(),
+                'controversy_check_failed': item.get('controversy_check_failed', False)  # Pass the flag
             })
             
             llm_queue.task_done()
@@ -497,6 +518,11 @@ async def result_worker(worker_id: int, result_queue: asyncio.Queue, timing_stat
                 if not channel_name and item.get('channel_id'):
                     channel_name = f"Channel {item['channel_id']}"
                 
+                # Check if this channel was flagged for controversy
+                controversy_info = None
+                if url in analysis_results[job_id].get('controversy_check_failures', {}):
+                    controversy_info = analysis_results[job_id]['controversy_check_failures'][url]
+                
                 analysis_results[job_id]['results'][url] = {
                     "url": str(url),
                     "channel_id": item.get('channel_id', "unknown"),
@@ -504,7 +530,9 @@ async def result_worker(worker_id: int, result_queue: asyncio.Queue, timing_stat
                     "channel_handle": channel_handle or "Unknown", 
                     "video_analyses": [],
                     "summary": {},
-                    "original_videos": []
+                    "original_videos": [],
+                    "controversy_flagged": controversy_info is not None,
+                    "controversy_reason": controversy_info.get('reason') if controversy_info else None
                 }
             
             # Add this video's analysis to the channel

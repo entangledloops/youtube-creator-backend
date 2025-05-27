@@ -681,11 +681,14 @@ async def get_bulk_analysis_results(job_id: str):
         "processed_urls": job['processed_urls'],
         "results": job['results'],
         "failed_urls": job['failed_urls'],
+        # Add controversy check failures
+        "controversy_check_failures": job.get('controversy_check_failures', {}),
         # Add explicit counts for frontend debugging
         "summary_counts": {
             "successful": successful_count,
             "failed": failed_count, 
-            "total_processed": total_processed
+            "total_processed": total_processed,
+            "controversy_check_failures": len(job.get('controversy_check_failures', {}))
         }
     }
     
