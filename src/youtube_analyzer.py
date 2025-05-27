@@ -121,7 +121,7 @@ class YouTubeAnalyzer:
             
         try:
             # Track API call
-            from src.app import youtube_rate_limiter
+            from src.rate_limiter import youtube_rate_limiter
             youtube_rate_limiter['total_api_calls'] += 1
             
             url = "https://www.googleapis.com/youtube/v3/channels"
@@ -306,7 +306,7 @@ class YouTubeAnalyzer:
     def _get_videos_from_api(self, channel_id, limit):
         """Get videos using YouTube API"""
         # Track API call
-        from src.app import youtube_rate_limiter
+        from src.rate_limiter import youtube_rate_limiter
         youtube_rate_limiter['total_api_calls'] += 1
         
         url = f"https://www.googleapis.com/youtube/v3/search"

@@ -15,7 +15,9 @@ VERSION_HISTORY = {
             "Fixed channel name extraction for channel ID URLs to ensure controversy screening works",
             "Added detailed debug logging for controversy screening to track LLM responses",
             "Improved channel info extraction to always get channel name even from direct channel ID URLs",
-            "Fixed import issue for API call tracking in youtube_analyzer.py"
+            "Fixed import issue for API call tracking in youtube_analyzer.py",
+            "Refactored app.py into logical modules: pipeline_workers, job_manager, controversy_screener, export_handlers",
+            "Moved rate limiter to separate module to avoid circular imports"
         ]
     },
     "1.0.2": {
