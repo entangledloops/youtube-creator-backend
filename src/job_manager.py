@@ -9,13 +9,15 @@ from datetime import datetime, timedelta
 from typing import List, Dict, Any
 import pandas as pd
 import os
+import traceback
 
 from src.youtube_analyzer import YouTubeAnalyzer
 from src.llm_analyzer import LLMAnalyzer
 from src.pipeline_workers import (
     channel_discovery_worker, controversy_screening_worker,
     video_transcript_worker, llm_worker, result_worker,
-    monitor_pipeline_detailed, update_pipeline_stage
+    monitor_pipeline_detailed, update_pipeline_stage,
+    clear_queues
 )
 
 logger = logging.getLogger(__name__)
@@ -29,168 +31,213 @@ job_queue_lock = asyncio.Lock()
 active_job_tasks = {}  # job_id -> list of asyncio tasks
 
 async def process_creators_pipeline(job_id: str, urls: List[str], video_limit: int, llm_provider: str, analysis_results: dict):
-    """Queue-based pipeline with proper video-level rate limiting"""
+    """Queue-based pipeline with proper video-level rate limiting - NON-BLOCKING"""
     try:
-        # Initialize timing statistics
+        logger.info(f"🚀 Starting pipeline for job {job_id} with {len(urls)} URLs")
+        
+        # Update job status
+        analysis_results[job_id]['status'] = 'processing'
+        analysis_results[job_id]['started_at'] = datetime.now().isoformat()
+        
+        # Create queues
+        channel_queue = asyncio.Queue()
+        controversy_queue = asyncio.Queue()
+        video_queue = asyncio.Queue()
+        llm_queue = asyncio.Queue()
+        result_queue = asyncio.Queue()
+        
+        # Store queues for status updates
+        queues = {
+            'channel_queue': channel_queue,
+            'controversy_queue': controversy_queue,
+            'video_queue': video_queue,
+            'transcript_queue': video_queue,  # Alias for status endpoint
+            'llm_queue': llm_queue,
+            'result_queue': result_queue
+        }
+        
+        # Initialize analyzers
+        youtube_analyzer = YouTubeAnalyzer()
+        llm_analyzer = LLMAnalyzer(provider=llm_provider)
+        
+        # Initialize timing stats
         timing_stats = {
             'channel_discovery': [],
             'controversy_screening': [],
             'transcript_fetch': [],
-            'llm_analysis': [],
-            'result_processing': []
+            'llm_analysis': []
         }
         
-        # Create queues for the pipeline
-        channel_queue = asyncio.Queue(maxsize=1000)  # Channel URLs to discover videos
-        controversy_queue = asyncio.Queue(maxsize=1000)  # Channels to screen for controversy
-        video_queue = asyncio.Queue(maxsize=1000)    # Individual videos for transcript fetching
-        llm_queue = asyncio.Queue(maxsize=1000)      # Videos with transcripts for LLM analysis
-        result_queue = asyncio.Queue(maxsize=1000)   # LLM results for final processing
-        
-        # Initialize YouTube analyzer
-        youtube_analyzer = YouTubeAnalyzer()
-        
-        # Initialize LLM analyzer
-        actual_provider = os.getenv("LLM_PROVIDER", "local")
-        llm_analyzer = LLMAnalyzer(provider=actual_provider)
-        
-        # Queue all URLs for channel discovery
-        for url in urls:
-            await channel_queue.put({
-                'url': url,
-                'video_limit': video_limit
-            })
-        
-        # Track initial queue size
-        initial_channel_size = channel_queue.qsize()
-        logger.info(f"📊 Pipeline initialized with {initial_channel_size} channels to process")
-        
-        # Create workers for each stage
+        # Create worker tasks
         workers = []
         
-        # Channel discovery workers (2 workers)
-        channel_workers = []
-        for i in range(2):
+        # Channel discovery workers
+        for i in range(3):
             worker = asyncio.create_task(
                 channel_discovery_worker(i, channel_queue, controversy_queue, youtube_analyzer, timing_stats, job_id, analysis_results)
             )
+            # Create closure to properly capture queues
+            def make_get_queues(q):
+                return lambda: q
+            def make_clear_queues(q):
+                return lambda: clear_queues(q)
+            worker.get_queues = make_get_queues(queues)
+            worker.clear_queues = make_clear_queues(queues)
             workers.append(worker)
-            channel_workers.append(worker)
         
-        # Controversy screening workers (2 workers)
-        controversy_workers = []
+        # Controversy screening workers
         for i in range(2):
             worker = asyncio.create_task(
                 controversy_screening_worker(i, controversy_queue, video_queue, llm_analyzer, timing_stats, job_id, analysis_results)
             )
+            worker.get_queues = make_get_queues(queues)
+            worker.clear_queues = make_clear_queues(queues)
             workers.append(worker)
-            controversy_workers.append(worker)
         
-        # Video transcript workers (4 workers)
-        transcript_workers = []
-        for i in range(4):
+        # Video transcript workers
+        for i in range(5):
             worker = asyncio.create_task(
                 video_transcript_worker(i, video_queue, llm_queue, youtube_analyzer, timing_stats, job_id, analysis_results)
             )
+            worker.get_queues = make_get_queues(queues)
+            worker.clear_queues = make_clear_queues(queues)
             workers.append(worker)
-            transcript_workers.append(worker)
         
-        # LLM analysis workers (3 workers)
-        llm_workers = []
-        for i in range(3):
+        # LLM workers
+        for i in range(2):
             worker = asyncio.create_task(
                 llm_worker(i, llm_queue, result_queue, llm_analyzer, timing_stats, job_id, analysis_results)
             )
+            worker.get_queues = make_get_queues(queues)
+            worker.clear_queues = make_clear_queues(queues)
             workers.append(worker)
-            llm_workers.append(worker)
         
-        # Result processing worker (1 worker)
+        # Result worker
         result_worker_task = asyncio.create_task(
             result_worker(0, result_queue, timing_stats, job_id, analysis_results)
         )
+        result_worker_task.get_queues = make_get_queues(queues)
+        result_worker_task.clear_queues = make_clear_queues(queues)
         workers.append(result_worker_task)
         
-        # Monitor pipeline progress
+        # Monitor task
         monitor_task = asyncio.create_task(
-            monitor_pipeline_detailed(job_id, channel_queue, controversy_queue, video_queue, llm_queue, result_queue, len(urls), timing_stats, analysis_results)
+            monitor_pipeline_detailed(
+                job_id, channel_queue, controversy_queue, video_queue, 
+                llm_queue, result_queue, len(urls), timing_stats, analysis_results
+            )
         )
+        monitor_task.get_queues = make_get_queues(queues)
+        monitor_task.clear_queues = make_clear_queues(queues)
+        workers.append(monitor_task)
         
-        # Track all tasks for cancellation
-        if job_id not in active_job_tasks:
-            active_job_tasks[job_id] = []
-        active_job_tasks[job_id].extend(workers + [monitor_task])
+        # Completion monitor task - this will handle job completion
+        completion_task = asyncio.create_task(
+            monitor_job_completion(job_id, urls, workers, queues, analysis_results)
+        )
+        workers.append(completion_task)
         
-        # Wait for all queues to be processed
-        await channel_queue.join()
-        logger.info(f"✅ All channels discovered for job {job_id}")
+        # Store all workers for cancellation
+        active_job_tasks[job_id] = workers
         
-        await controversy_queue.join()
-        logger.info(f"✅ All controversy screening completed for job {job_id}")
+        # Add URLs to channel queue - NON-BLOCKING
+        logger.info(f"📊 Pipeline initialized with {len(urls)} channels to process")
+        for url in urls:
+            await channel_queue.put({
+                'url': url,
+                'video_limit': video_limit,
+                'start_time': time.time()
+            })
         
-        await video_queue.join()
-        logger.info(f"✅ All video transcripts fetched for job {job_id}")
-        
-        await llm_queue.join()
-        logger.info(f"✅ All LLM analyses completed for job {job_id}")
-        
-        await result_queue.join()
-        logger.info(f"✅ All results processed for job {job_id}")
-        
-        # Cancel all workers
-        for worker in workers:
-            worker.cancel()
-        monitor_task.cancel()
-        
-        # Wait for all cancelled tasks to finish
-        await asyncio.gather(*workers, monitor_task, return_exceptions=True)
-        
-        # Wait a moment for final monitoring data
-        await asyncio.sleep(0.5)
-        
-        # Calculate final statistics
-        successful = len(analysis_results[job_id]['results'])
-        failed = len(analysis_results[job_id]['failed_urls'])
-        total_processed = successful + failed
-        
-        logger.info("=" * 100)
-        logger.info(f"🏁 FINAL STATISTICS for job {job_id}")
-        logger.info("=" * 100)
-        logger.info(f"📊 PROCESSING SUMMARY:")
-        logger.info(f"   └─ URLs submitted: {len(urls)}")
-        logger.info(f"   └─ URLs processed: {total_processed}")
-        logger.info(f"   └─ ✅ Successful: {successful}")
-        logger.info(f"   └─ ❌ Failed: {failed}")
-        
-        # Mark job as complete
-        analysis_results[job_id]['status'] = 'completed'
-        analysis_results[job_id]['completed_at'] = datetime.now().isoformat()
-        analysis_results[job_id]['processed_urls'] = total_processed
-        
-        # Create channel summaries from individual video results
-        await create_channel_summaries(job_id, analysis_results)
-        
-        # Clean up task tracking
-        if job_id in active_job_tasks:
-            del active_job_tasks[job_id]
+        # DO NOT WAIT FOR WORKERS - Let them run in background
+        logger.info(f"✅ Pipeline started for job {job_id} - workers running in background")
         
     except Exception as e:
-        logger.error(f"💥 Error in pipeline processing: {str(e)}")
-        if job_id in analysis_results:
-            analysis_results[job_id]['status'] = 'failed'
-            analysis_results[job_id]['error'] = str(e)
-            analysis_results[job_id]['completed_at'] = datetime.now().isoformat()
+        logger.error(f"Error starting pipeline for job {job_id}: {str(e)}")
+        logger.error(traceback.format_exc())
+        
+        # Mark job as failed
+        analysis_results[job_id]['status'] = 'failed'
+        analysis_results[job_id]['completed_at'] = datetime.now().isoformat()
+        analysis_results[job_id]['error'] = str(e)
+        
+        # Clean up
+        if job_id in active_job_tasks:
+            del active_job_tasks[job_id]
 
-            # Cancel and clean up any running workers
-            if 'workers' in locals():
-                for worker in workers:
-                    worker.cancel()
-                if 'monitor_task' in locals():
-                    monitor_task.cancel()
-                await asyncio.gather(*workers, monitor_task, return_exceptions=True)
+async def monitor_job_completion(job_id: str, urls: List[str], workers: List[asyncio.Task], 
+                               queues: dict, analysis_results: dict):
+    """Monitor job completion without blocking"""
+    try:
+        while True:
+            await asyncio.sleep(2)  # Check every 2 seconds
             
-            # Clean up task tracking on failure
-            if job_id in active_job_tasks:
-                del active_job_tasks[job_id]
+            # Check if job is cancelled
+            if analysis_results[job_id]['status'] in ['cancelled', 'cancelling']:
+                logger.info(f"🛑 Job {job_id} cancelled, stopping completion monitor")
+                break
+            
+            # Check if all work is done
+            all_queues_empty = all(q.empty() for q in queues.values())
+            
+            # Check completion based on processed URLs
+            total_processed = len(analysis_results[job_id]['results']) + len(analysis_results[job_id]['failed_urls'])
+            all_urls_processed = total_processed >= len(urls)
+            
+            if all_queues_empty and all_urls_processed:
+                logger.info(f"✅ Job {job_id} completed - all URLs processed")
+                
+                # Mark job as completed
+                analysis_results[job_id]['status'] = 'completed'
+                analysis_results[job_id]['completed_at'] = datetime.now().isoformat()
+                analysis_results[job_id]['processed_urls'] = total_processed
+                
+                # Create channel summaries
+                await create_channel_summaries(job_id, analysis_results)
+                
+                # Cancel all workers
+                for worker in workers:
+                    if not worker.done():
+                        worker.cancel()
+                
+                # Clean up
+                if job_id in active_job_tasks:
+                    del active_job_tasks[job_id]
+                
+                # Start next job in queue
+                await start_next_job(analysis_results)
+                break
+                
+    except Exception as e:
+        logger.error(f"Error in completion monitor for job {job_id}: {str(e)}")
+        logger.error(traceback.format_exc())
+
+async def start_next_job(analysis_results: dict):
+    """Start the next job in queue if any"""
+    async with job_queue_lock:
+        global current_job_id
+        current_job_id = None
+        
+        if job_queue:
+            next_job = job_queue.pop(0)
+            current_job_id = next_job['job_id']
+            
+            # Update status
+            analysis_results[current_job_id]['status'] = 'processing'
+            analysis_results[current_job_id]['queue_position'] = 0
+            
+            logger.info(f"🚀 Starting next queued job {current_job_id}")
+            
+            # Start processing - NON-BLOCKING
+            asyncio.create_task(
+                process_creators_pipeline(
+                    current_job_id,
+                    next_job['urls'],
+                    next_job['video_limit'],
+                    next_job['llm_provider'],
+                    analysis_results
+                )
+            )
 
 async def create_channel_summaries(job_id: str, analysis_results: dict):
     """Create channel summaries from individual video results"""
@@ -224,7 +271,7 @@ async def create_channel_summaries(job_id: str, analysis_results: dict):
                     })
         
         # Process each channel's video results
-        channels_to_remove = []  # Track channels that should be moved to failed
+        channels_to_remove = []
         
         for url, channel_data in analysis_results[job_id]['results'].items():
             # Check if this channel has any successfully analyzed videos
@@ -314,35 +361,11 @@ async def create_channel_summaries(job_id: str, analysis_results: dict):
         logger.error(f"💥 Error creating channel summaries: {str(e)}")
 
 async def process_job_with_cleanup(job_id: str, urls: List[str], video_limit: int, llm_provider: str, analysis_results: dict):
-    """Process a job and handle queue cleanup when done"""
+    """Process a job without blocking - just start the pipeline"""
     try:
+        # Start the pipeline - this will return immediately
         await process_creators_pipeline(job_id, urls, video_limit, llm_provider, analysis_results)
-    finally:
-        # Clean up and start next job
-        async with job_queue_lock:
-            global current_job_id
-            current_job_id = None
-            
-            # Start next job if any are queued
-            if job_queue:
-                next_job = job_queue.pop(0)
-                current_job_id = next_job['job_id']
-                
-                # Update status and start processing
-                analysis_results[current_job_id]['status'] = 'processing'
-                analysis_results[current_job_id]['queue_position'] = 0
-                
-                logger.info(f"🚀 Starting next queued job {current_job_id}")
-                
-                task = asyncio.create_task(
-                    process_job_with_cleanup(
-                        current_job_id,
-                        next_job['urls'],
-                        next_job['video_limit'],
-                        next_job['llm_provider'],
-                        analysis_results
-                    )
-                )
-                
-                # Track task for cancellation
-                active_job_tasks[current_job_id] = [task] 
+    except Exception as e:
+        logger.error(f"Error starting job {job_id}: {str(e)}")
+        # If we fail to start, clean up and start next job
+        await start_next_job(analysis_results) 

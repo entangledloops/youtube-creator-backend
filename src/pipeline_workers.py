@@ -876,8 +876,9 @@ async def process_job_with_cleanup(job_id: str, urls: List[str], video_limit: in
         monitor_task.clear_queues = lambda: clear_queues(queues)
         workers.append(monitor_task)
         
-        # Add all workers to active_job_tasks
-        active_job_tasks[job_id] = workers
+        # Add all workers to active_job_tasks if it exists
+        if 'active_job_tasks' in globals():
+            active_job_tasks[job_id] = workers
         
         # Add URLs to channel queue
         for url in urls:
@@ -904,7 +905,7 @@ async def process_job_with_cleanup(job_id: str, urls: List[str], video_limit: in
         analysis_results[job_id]['error'] = str(e)
     finally:
         # Clean up
-        if job_id in active_job_tasks:
+        if 'active_job_tasks' in globals() and job_id in active_job_tasks:
             del active_job_tasks[job_id]
 
 async def clear_queues(queues: dict):
