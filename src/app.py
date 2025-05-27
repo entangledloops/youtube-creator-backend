@@ -414,7 +414,7 @@ async def bulk_analyze(
             
             # Detailed pipeline stage tracking
             'pipeline_stages': {
-                'queued_for_discovery': len(cleaned_urls),   # Channels waiting for video discovery
+                'queued_for_discovery': 0,                   # Channels waiting for video discovery (will be incremented as URLs are queued)
                 'discovering_videos': 0,                     # Channels currently being processed for video discovery
                 'queued_for_controversy': 0,                 # Channels waiting for controversy screening
                 'screening_controversy': 0,                  # Channels currently being screened for controversy

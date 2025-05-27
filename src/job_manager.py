@@ -140,14 +140,32 @@ async def process_creators_pipeline(job_id: str, urls: List[str], video_limit: i
         # Store all workers for cancellation
         active_job_tasks[job_id] = workers
         
-        # Add URLs to channel queue - NON-BLOCKING
-        logger.info(f"📊 Pipeline initialized with {len(urls)} channels to process")
-        for url in urls:
-            await channel_queue.put({
-                'url': url,
-                'video_limit': video_limit,
-                'start_time': time.time()
-            })
+        # Create a task to add URLs to the queue asynchronously
+        async def add_urls_to_queue():
+            """Add URLs to channel queue asynchronously"""
+            try:
+                logger.info(f"📊 Starting to queue {len(urls)} channels for processing")
+                for i, url in enumerate(urls):
+                    # Update pipeline stage to show URLs being queued
+                    update_pipeline_stage(job_id, None, 'queued_for_discovery', analysis_results=analysis_results)
+                    
+                    await channel_queue.put({
+                        'url': url,
+                        'video_limit': video_limit,
+                        'start_time': time.time()
+                    })
+                    
+                    # Log progress every 10 URLs
+                    if (i + 1) % 10 == 0:
+                        logger.debug(f"📊 Queued {i + 1}/{len(urls)} URLs for discovery")
+                        
+                logger.info(f"✅ Finished queuing all {len(urls)} URLs for job {job_id}")
+            except Exception as e:
+                logger.error(f"Error adding URLs to queue: {str(e)}")
+        
+        # Start the URL queuing task - NON-BLOCKING
+        url_task = asyncio.create_task(add_urls_to_queue())
+        workers.append(url_task)  # Add to workers list so it gets cancelled if job is cancelled
         
         # DO NOT WAIT FOR WORKERS - Let them run in background
         logger.info(f"✅ Pipeline started for job {job_id} - workers running in background")

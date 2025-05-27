@@ -134,8 +134,10 @@ async def channel_discovery_worker(worker_id: int, channel_queue: asyncio.Queue,
             
             logger.debug(f"📋 Channel Worker {worker_id}: Discovering videos for {url}")
             
-            # Get channel info and video list (without transcripts yet)
-            channel_id, channel_name, channel_handle = youtube_analyzer.extract_channel_info_from_url(url)
+            # Get channel info and video list (without transcripts yet) - RUN IN THREAD TO AVOID BLOCKING
+            channel_id, channel_name, channel_handle = await asyncio.to_thread(
+                youtube_analyzer.extract_channel_info_from_url, url
+            )
             
             if not channel_id:
                 error_msg = f"Failed to access YouTube channel. The URL may be invalid, private, or the channel may not exist: {url}"
@@ -153,8 +155,10 @@ async def channel_discovery_worker(worker_id: int, channel_queue: asyncio.Queue,
                 channel_queue.task_done()
                 logger.debug(f"📋 Channel Worker {worker_id}: Marked invalid channel as done (queue size: {channel_queue.qsize()})")
             else:
-                # Get video list from channel
-                videos = youtube_analyzer.get_videos_from_channel(channel_id, limit=video_limit)
+                # Get video list from channel - RUN IN THREAD TO AVOID BLOCKING
+                videos = await asyncio.to_thread(
+                    youtube_analyzer.get_videos_from_channel, channel_id, limit=video_limit
+                )
                 
                 if not videos:
                     error_msg = f"Channel '{channel_name or 'Unknown'}' has no videos available for analysis"
