@@ -133,6 +133,66 @@ youtube_analyzer = YouTubeAnalyzer(youtube_api_key=youtube_api_key)
 # Global storage for analysis results with detailed pipeline tracking
 analysis_results = {}
 
+# Background task for monitoring abandoned jobs
+abandoned_job_monitor_task = None
+ABANDONED_JOB_TIMEOUT = 30  # seconds
+
+async def monitor_abandoned_jobs():
+    """Background task to monitor and cancel abandoned jobs"""
+    while True:
+        try:
+            current_time = datetime.now()
+            
+            # Check all jobs in analysis_results
+            for job_id, job in list(analysis_results.items()):
+                # Skip completed, cancelled, or failed jobs
+                if job['status'] in ['completed', 'cancelled', 'failed']:
+                    continue
+                    
+                # Get last status check time
+                last_check = job.get('last_status_check')
+                if not last_check:
+                    continue
+                    
+                # Convert string timestamp to datetime if needed
+                if isinstance(last_check, str):
+                    last_check = datetime.fromisoformat(last_check)
+                    
+                # Check if job has been abandoned
+                time_since_last_check = (current_time - last_check).total_seconds()
+                if time_since_last_check > ABANDONED_JOB_TIMEOUT:
+                    logger.warning(f"🕒 Job {job_id} appears abandoned (no status checks for {time_since_last_check:.1f}s)")
+                    
+                    # Cancel the job
+                    try:
+                        await cancel_bulk_analysis(job_id)
+                        logger.info(f"✅ Automatically cancelled abandoned job {job_id}")
+                    except Exception as e:
+                        logger.error(f"❌ Failed to auto-cancel abandoned job {job_id}: {str(e)}")
+            
+            # Sleep for a bit before next check
+            await asyncio.sleep(5)  # Check every 5 seconds
+            
+        except Exception as e:
+            logger.error(f"Error in abandoned job monitor: {str(e)}")
+            await asyncio.sleep(5)  # Sleep before retrying
+
+@app.on_event("startup")
+async def startup_event():
+    """Start background tasks on app startup"""
+    global abandoned_job_monitor_task
+    abandoned_job_monitor_task = asyncio.create_task(monitor_abandoned_jobs())
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Clean up background tasks on app shutdown"""
+    if abandoned_job_monitor_task:
+        abandoned_job_monitor_task.cancel()
+        try:
+            await abandoned_job_monitor_task
+        except asyncio.CancelledError:
+            pass
+
 @app.get("/")
 async def root():
     return {
@@ -337,6 +397,7 @@ async def bulk_analyze(
         analysis_results[job_id] = {
             'status': 'queued',
             'started_at': datetime.now().isoformat(),
+            'last_status_check': datetime.now().isoformat(),
             'total_urls': len(cleaned_urls),
             'processed_urls': 0,
             'results': {},
@@ -481,6 +542,9 @@ async def get_bulk_analysis_status(job_id: str):
         if not job:
             raise HTTPException(status_code=404, detail="Job not found")
         
+        # Update last status check timestamp
+        job['last_status_check'] = datetime.now().isoformat()
+        
         # Calculate progress percentages
         total_urls = job['total_urls']
         successful_count = len(job['results'])
@@ -511,6 +575,28 @@ async def get_bulk_analysis_status(job_id: str):
         if 'controversy_check_failed' in pipeline_stages:
             pipeline_stages['controversy_check_failed'] = controversy_failed_count
         
+        # Get real-time queue sizes from active job tasks
+        queue_sizes = {
+            'channel_queue_size': 0,
+            'controversy_queue_size': 0,
+            'video_queue_size': 0,
+            'transcript_queue_size': 0,
+            'analysis_queue_size': 0
+        }
+        
+        if job_id in active_job_tasks:
+            for task in active_job_tasks[job_id]:
+                if hasattr(task, 'get_queues'):
+                    queues = task.get_queues()
+                    if queues:
+                        queue_sizes.update({
+                            'channel_queue_size': queues.get('channel_queue', asyncio.Queue()).qsize(),
+                            'controversy_queue_size': queues.get('controversy_queue', asyncio.Queue()).qsize(),
+                            'video_queue_size': queues.get('video_queue', asyncio.Queue()).qsize(),
+                            'transcript_queue_size': queues.get('transcript_queue', asyncio.Queue()).qsize(),
+                            'analysis_queue_size': queues.get('llm_queue', asyncio.Queue()).qsize()
+                        })
+        
         # Build detailed response
         response = {
             "job_id": job_id,
@@ -519,7 +605,7 @@ async def get_bulk_analysis_status(job_id: str):
             "completed_at": job.get('completed_at'),
             "total_urls": job['total_urls'],
             "processed_urls": job['processed_urls'],
-            "api_version": __version__,  # Add version info
+            "api_version": __version__,
             
             # Basic progress info (for backward compatibility)
             "progress": {
@@ -541,7 +627,7 @@ async def get_bulk_analysis_status(job_id: str):
             # Detailed pipeline stage breakdown
             "pipeline_stages": pipeline_stages,
             
-            # Controversy check failures (channels that were processed despite check failure)
+            # Controversy check failures
             "controversy_check_failures": {
                 "total": len(controversy_failures),
                 "by_status": {
@@ -564,22 +650,23 @@ async def get_bulk_analysis_status(job_id: str):
             # ETA and performance information
             "eta": eta_info,
             
-            # Queue information (if applicable)
-            "queue_info": {}
+            # Queue information with real-time sizes
+            "queue_info": queue_sizes
         }
         
-        # Add queue information for queued jobs
+        # Add queue position info for queued jobs
         if job['status'] == 'queued':
-            response["queue_info"] = {
+            response["queue_info"].update({
                 "queue_position": job.get('queue_position', 0),
                 "estimated_wait_minutes": job.get('estimated_wait_minutes', 0),
                 "estimated_start_time": job.get('estimated_start_time'),
                 "message": f"Your job is queued at position {job.get('queue_position', 0)}. Estimated wait time: {job.get('estimated_wait_minutes', 0)} minutes."
-            }
+            })
         
         # DEBUG: Log what we're sending to frontend
         logger.info(f"   📤 Sending to frontend - Channel Progress: {channel_progress_percentage:.1f}%, Video Progress: {video_progress_percentage:.1f}%")
         logger.info(f"   📤 Pipeline stages being sent: {response['pipeline_stages']}")
+        logger.info(f"   📤 Queue sizes: {queue_sizes}")
         
         return response
         
@@ -620,7 +707,23 @@ async def get_bulk_analysis_results(job_id: str):
             logger.info(f"      └─ Error: {failed_url['error']}")
             if 'channel_name' in failed_url:
                 logger.info(f"      └─ Channel: {failed_url['channel_name']} ({failed_url.get('video_count', 0)} videos)")
-        
+    
+    # Calculate video-level statistics
+    total_videos = 0
+    videos_with_transcripts = 0
+    videos_analyzed = 0
+    videos_completed = 0
+    
+    for channel_result in job['results'].values():
+        total_videos += len(channel_result.get('video_analyses', []))
+        for video in channel_result.get('video_analyses', []):
+            if video.get('transcript'):
+                videos_with_transcripts += 1
+            if video.get('analysis'):
+                videos_analyzed += 1
+            if video.get('analysis') and video.get('transcript'):
+                videos_completed += 1
+    
     response_data = {
         "job_id": job_id,
         "status": job['status'],
@@ -638,6 +741,13 @@ async def get_bulk_analysis_results(job_id: str):
             "failed": failed_count, 
             "total_processed": total_processed,
             "controversy_check_failures": len(job.get('controversy_check_failures', {}))
+        },
+        # Add video-level statistics
+        "video_statistics": {
+            "total_videos": total_videos,
+            "videos_with_transcripts": videos_with_transcripts,
+            "videos_analyzed": videos_analyzed,
+            "videos_completed": videos_completed
         }
     }
     
@@ -645,7 +755,13 @@ async def get_bulk_analysis_results(job_id: str):
     if job['status'] == 'cancelled':
         response_data["cancellation_info"] = {
             "partial_results": True,
-            "message": f"Job was cancelled. Partial results available for {successful_count} channels."
+            "message": f"Job was cancelled. Partial results available for {successful_count} channels.",
+            "statistics": {
+                "channels_processed": successful_count,
+                "videos_processed": total_videos,
+                "completion_percentage": (total_processed / job['total_urls'] * 100) if job['total_urls'] > 0 else 0,
+                "video_completion_percentage": (videos_completed / total_videos * 100) if total_videos > 0 else 0
+            }
         }
     
     logger.info(f"   📤 Sending to frontend: {successful_count} results, {failed_count} failed_urls")
@@ -688,16 +804,49 @@ async def cancel_bulk_analysis(job_id: str):
             # Cancel active job
             analysis_results[job_id]['status'] = 'cancelling'
             
+            # Calculate current progress before cancellation
+            successful_count = len(job['results'])
+            failed_count = len(job['failed_urls'])
+            total_processed = successful_count + failed_count
+            
+            # Calculate video-level statistics
+            total_videos = 0
+            videos_with_transcripts = 0
+            videos_analyzed = 0
+            videos_completed = 0
+            
+            for channel_result in job['results'].values():
+                total_videos += len(channel_result.get('video_analyses', []))
+                for video in channel_result.get('video_analyses', []):
+                    if video.get('transcript'):
+                        videos_with_transcripts += 1
+                    if video.get('analysis'):
+                        videos_analyzed += 1
+                    if video.get('analysis') and video.get('transcript'):
+                        videos_completed += 1
+            
             # Cancel all active tasks for this job
             if job_id in active_job_tasks:
                 logger.info(f"🛑 Cancelling {len(active_job_tasks[job_id])} active tasks for job {job_id}")
+                
+                # First, clear all queues to prevent new work from being picked up
+                for task in active_job_tasks[job_id]:
+                    if hasattr(task, 'clear_queues'):
+                        await task.clear_queues()
+                
+                # Then cancel the tasks
                 for task in active_job_tasks[job_id]:
                     if not task.done():
                         task.cancel()
                 
-                # Wait for tasks to finish cancelling
+                # Wait for tasks to finish cancelling with a timeout
                 try:
-                    await asyncio.gather(*active_job_tasks[job_id], return_exceptions=True)
+                    await asyncio.wait_for(
+                        asyncio.gather(*active_job_tasks[job_id], return_exceptions=True),
+                        timeout=5.0  # 5 second timeout for graceful shutdown
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(f"Timeout waiting for tasks to cancel, forcing shutdown")
                 except Exception as e:
                     logger.warning(f"Error during task cancellation: {str(e)}")
                 
@@ -740,6 +889,23 @@ async def cancel_bulk_analysis(job_id: str):
     # Calculate final statistics for the cancelled job
     successful_count = len(job['results'])
     failed_count = len(job['failed_urls'])
+    total_processed = successful_count + failed_count
+    
+    # Calculate video-level statistics
+    total_videos = 0
+    videos_with_transcripts = 0
+    videos_analyzed = 0
+    videos_completed = 0
+    
+    for channel_result in job['results'].values():
+        total_videos += len(channel_result.get('video_analyses', []))
+        for video in channel_result.get('video_analyses', []):
+            if video.get('transcript'):
+                videos_with_transcripts += 1
+            if video.get('analysis'):
+                videos_analyzed += 1
+            if video.get('analysis') and video.get('transcript'):
+                videos_completed += 1
     
     return {
         "job_id": job_id,
@@ -748,10 +914,19 @@ async def cancel_bulk_analysis(job_id: str):
         "partial_results": {
             "successful_channels": successful_count,
             "failed_urls": failed_count,
-            "total_processed": successful_count + failed_count,
-            "results_preserved": successful_count > 0
+            "total_processed": total_processed,
+            "results_preserved": successful_count > 0,
+            "completion_percentage": (total_processed / job['total_urls'] * 100) if job['total_urls'] > 0 else 0
         },
-        "cancelled_at": analysis_results[job_id]['completed_at']
+        "video_statistics": {
+            "total_videos": total_videos,
+            "videos_with_transcripts": videos_with_transcripts,
+            "videos_analyzed": videos_analyzed,
+            "videos_completed": videos_completed,
+            "completion_percentage": (videos_completed / total_videos * 100) if total_videos > 0 else 0
+        },
+        "cancelled_at": analysis_results[job_id]['completed_at'],
+        "next_steps": "You can retrieve the partial results using the GET /api/bulk-analyze/{job_id}/results endpoint"
     }
 
 @app.get("/api/bulk-analyze/{job_id}/csv")

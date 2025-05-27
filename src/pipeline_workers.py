@@ -4,7 +4,7 @@ Pipeline worker functions for processing YouTube channels through various stages
 import asyncio
 import logging
 import time
-from typing import Dict, Any
+from typing import Dict, Any, List
 from datetime import datetime, timedelta
 import traceback
 
@@ -786,3 +786,133 @@ async def monitor_pipeline_detailed(job_id: str, channel_queue: asyncio.Queue = 
     except Exception as e:
         logger.error(f"Error in monitor_pipeline_detailed: {str(e)}")
         logger.error(traceback.format_exc()) 
+
+async def process_job_with_cleanup(job_id: str, urls: List[str], video_limit: int, llm_provider: str, analysis_results: dict):
+    """Process a job with proper cleanup and queue management"""
+    try:
+        # Create queues
+        channel_queue = asyncio.Queue()
+        controversy_queue = asyncio.Queue()
+        video_queue = asyncio.Queue()
+        llm_queue = asyncio.Queue()
+        result_queue = asyncio.Queue()
+        
+        # Store queues for status updates
+        queues = {
+            'channel_queue': channel_queue,
+            'controversy_queue': controversy_queue,
+            'video_queue': video_queue,
+            'transcript_queue': video_queue,  # Alias for status endpoint
+            'llm_queue': llm_queue
+        }
+        
+        # Initialize analyzers
+        youtube_analyzer = YouTubeAnalyzer()
+        llm_analyzer = LLMAnalyzer(provider=llm_provider)
+        
+        # Initialize timing stats
+        timing_stats = {
+            'channel_discovery': [],
+            'controversy_screening': [],
+            'transcript_fetch': [],
+            'llm_analysis': []
+        }
+        
+        # Create worker tasks
+        workers = []
+        
+        # Channel discovery workers
+        for i in range(3):  # 3 channel discovery workers
+            worker = asyncio.create_task(
+                channel_discovery_worker(i, channel_queue, controversy_queue, youtube_analyzer, timing_stats, job_id, analysis_results)
+            )
+            worker.get_queues = lambda: queues
+            worker.clear_queues = lambda: clear_queues(queues)
+            workers.append(worker)
+        
+        # Controversy screening workers
+        for i in range(2):  # 2 controversy screening workers
+            worker = asyncio.create_task(
+                controversy_screening_worker(i, controversy_queue, video_queue, llm_analyzer, timing_stats, job_id, analysis_results)
+            )
+            worker.get_queues = lambda: queues
+            worker.clear_queues = lambda: clear_queues(queues)
+            workers.append(worker)
+        
+        # Video transcript workers
+        for i in range(5):  # 5 video transcript workers
+            worker = asyncio.create_task(
+                video_transcript_worker(i, video_queue, llm_queue, youtube_analyzer, timing_stats, job_id, analysis_results)
+            )
+            worker.get_queues = lambda: queues
+            worker.clear_queues = lambda: clear_queues(queues)
+            workers.append(worker)
+        
+        # LLM workers
+        for i in range(2):  # 2 LLM workers
+            worker = asyncio.create_task(
+                llm_worker(i, llm_queue, result_queue, llm_analyzer, timing_stats, job_id, analysis_results)
+            )
+            worker.get_queues = lambda: queues
+            worker.clear_queues = lambda: clear_queues(queues)
+            workers.append(worker)
+        
+        # Result worker
+        result_worker_task = asyncio.create_task(
+            result_worker(0, result_queue, timing_stats, job_id, analysis_results)
+        )
+        result_worker_task.get_queues = lambda: queues
+        result_worker_task.clear_queues = lambda: clear_queues(queues)
+        workers.append(result_worker_task)
+        
+        # Monitor task
+        monitor_task = asyncio.create_task(
+            monitor_pipeline_detailed(
+                job_id, channel_queue, controversy_queue, video_queue, 
+                llm_queue, result_queue, len(urls), timing_stats, analysis_results
+            )
+        )
+        monitor_task.get_queues = lambda: queues
+        monitor_task.clear_queues = lambda: clear_queues(queues)
+        workers.append(monitor_task)
+        
+        # Add all workers to active_job_tasks
+        active_job_tasks[job_id] = workers
+        
+        # Add URLs to channel queue
+        for url in urls:
+            await channel_queue.put({
+                'url': url,
+                'video_limit': video_limit,
+                'start_time': time.time()
+            })
+        
+        # Wait for all workers to complete
+        await asyncio.gather(*workers)
+        
+        # Mark job as completed
+        analysis_results[job_id]['status'] = 'completed'
+        analysis_results[job_id]['completed_at'] = datetime.now().isoformat()
+        
+    except Exception as e:
+        logger.error(f"Error processing job {job_id}: {str(e)}")
+        logger.error(traceback.format_exc())
+        
+        # Mark job as failed
+        analysis_results[job_id]['status'] = 'failed'
+        analysis_results[job_id]['completed_at'] = datetime.now().isoformat()
+        analysis_results[job_id]['error'] = str(e)
+    finally:
+        # Clean up
+        if job_id in active_job_tasks:
+            del active_job_tasks[job_id]
+
+async def clear_queues(queues: dict):
+    """Clear all queues to prevent new work from being picked up"""
+    for queue in queues.values():
+        while not queue.empty():
+            try:
+                queue.get_nowait()
+                queue.task_done()
+            except asyncio.QueueEmpty:
+                break 
