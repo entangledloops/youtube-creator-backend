@@ -44,10 +44,30 @@ class YouTubeAnalyzer:
             # Channel URL pattern: youtube.com/channel/UC...
             if 'youtube.com/channel/' in url:
                 channel_id = parsed_url.path.split('/channel/')[1].split('/')[0]
-                channel_info = self._get_channel_info_from_api(channel_id)
-                if channel_info:
-                    channel_name = channel_info.get('title')
-                    channel_handle = channel_info.get('customUrl')
+                # Always try to get channel info from the page
+                response = requests.get(url)
+                soup = BeautifulSoup(response.text, 'html.parser')
+                
+                # Get channel name from page title
+                title_tag = soup.find('title')
+                if title_tag:
+                    channel_name = title_tag.text.replace(' - YouTube', '').strip()
+                
+                # Try to get channel handle from the page
+                for link in soup.find_all('link'):
+                    if link.get('rel') == ['canonical']:
+                        canonical_url = link.get('href', '')
+                        if '/@' in canonical_url:
+                            channel_handle = '@' + canonical_url.split('/@')[1].split('/')[0]
+                            break
+                
+                # If we have API key, also try to get info from API
+                if self.youtube_api_key and not channel_name:
+                    channel_info = self._get_channel_info_from_api(channel_id)
+                    if channel_info:
+                        channel_name = channel_info.get('title')
+                        if not channel_handle:
+                            channel_handle = channel_info.get('customUrl')
             
             # User URL pattern: youtube.com/user/username or youtube.com/@handle
             elif 'youtube.com/user/' in url or 'youtube.com/c/' in url or 'youtube.com/@' in url:
@@ -100,6 +120,10 @@ class YouTubeAnalyzer:
             return None
             
         try:
+            # Track API call
+            from src.app import youtube_rate_limiter
+            youtube_rate_limiter['total_api_calls'] += 1
+            
             url = "https://www.googleapis.com/youtube/v3/channels"
             params = {
                 "key": self.youtube_api_key,
@@ -281,6 +305,10 @@ class YouTubeAnalyzer:
             
     def _get_videos_from_api(self, channel_id, limit):
         """Get videos using YouTube API"""
+        # Track API call
+        from src.app import youtube_rate_limiter
+        youtube_rate_limiter['total_api_calls'] += 1
+        
         url = f"https://www.googleapis.com/youtube/v3/search"
         params = {
             "key": self.youtube_api_key,

@@ -222,6 +222,39 @@ async def analyze_creator(request: CreatorAnalysisRequest):
         creator_url = str(request.creator_url).strip()
         logger.info(f"Analyzing creator URL: {creator_url}")
         
+        # Extract channel info first
+        channel_id, channel_name, channel_handle = youtube_analyzer.extract_channel_info_from_url(creator_url)
+        
+        if not channel_id:
+            raise HTTPException(status_code=404, detail="Could not extract channel information from URL")
+        
+        # Screen for controversies before proceeding
+        logger.info(f"🔍 Screening creator {channel_name} for controversies...")
+        is_controversial, controversy_reason = await screen_creator_for_controversy(
+            channel_name or "Unknown", 
+            channel_handle or "Unknown",
+            llm_analyzer
+        )
+        
+        if is_controversial:
+            logger.warning(f"🚫 Creator {channel_name} flagged for controversy: {controversy_reason}")
+            
+            # Return a response indicating the creator was flagged
+            return {
+                "channel_id": channel_id,
+                "channel_name": channel_name or "Unknown",
+                "channel_handle": channel_handle or "Unknown",
+                "video_analyses": [],
+                "summary": {
+                    "controversy_flagged": {
+                        "flagged": True,
+                        "reason": controversy_reason,
+                        "message": "This creator has been flagged for ongoing controversies and cannot be analyzed at this time."
+                    }
+                },
+                "status": "controversy_flagged"
+            }
+        
         # Get channel data (videos and transcripts) asynchronously
         # Only use concurrent processing for OpenAI
         use_concurrent = actual_provider == "openai"
@@ -655,6 +688,9 @@ async def bulk_analyze(
             'pipeline_stages': {
                 'queued_for_discovery': len(cleaned_urls),   # Channels waiting for video discovery
                 'discovering_videos': 0,                     # Channels currently being processed for video discovery
+                'queued_for_controversy': 0,                 # Channels waiting for controversy screening
+                'screening_controversy': 0,                  # Channels currently being screened for controversy
+                'controversy_check_failed': 0,               # Channels where controversy check failed (but continued)
                 'queued_for_transcripts': 0,                 # Individual videos waiting for transcript fetch
                 'fetching_transcripts': 0,                   # Individual videos currently being transcript fetched
                 'queued_for_llm': 0,                        # Videos with transcripts waiting for LLM analysis
@@ -925,6 +961,9 @@ async def get_bulk_analysis_status(job_id: str):
         
         # Detailed pipeline stage breakdown
         "pipeline_stages": job.get('pipeline_stages', {}),
+        
+        # Controversy check failures (channels that were processed despite check failure)
+        "controversy_check_failures": len(job.get('controversy_check_failures', {})),
         
         # ETA and performance information
         "eta": eta_info,
@@ -1331,134 +1370,128 @@ async def download_failed_urls_csv(job_id: str):
 
 async def process_creators_pipeline(job_id: str, urls: List[str], video_limit: int, llm_provider: str):
     """Queue-based pipeline with proper video-level rate limiting"""
-    start_time = time.time()
-    
     try:
-        logger.info(f"🚀 Starting pipeline for job {job_id} with {len(urls)} URLs")
-        logger.info(f"⚖️ Using 8 discovery workers, 5 transcript workers, 10 LLM workers")
+        # Initialize timing statistics
+        timing_stats = {
+            'channel_discovery': [],
+            'controversy_screening': [],
+            'transcript_fetch': [],
+            'llm_analysis': [],
+            'result_processing': []
+        }
         
-        # Always use environment LLM_PROVIDER (ignore any frontend input)
-        actual_llm_provider = os.getenv("LLM_PROVIDER", "local")
-        youtube_analyzer = YouTubeAnalyzer()
-        logger.info(f"Creating LLMAnalyzer with provider='{actual_llm_provider}' in pipeline")
-        llm_analyzer = LLMAnalyzer(provider=actual_llm_provider)
-        
-        # Create queues for pipeline stages
+        # Create queues for the pipeline
         channel_queue = asyncio.Queue(maxsize=1000)  # Channel URLs to discover videos
+        controversy_queue = asyncio.Queue(maxsize=1000)  # Channels to screen for controversy
         video_queue = asyncio.Queue(maxsize=1000)    # Individual videos for transcript fetching
         llm_queue = asyncio.Queue(maxsize=1000)      # Videos with transcripts for LLM analysis
         result_queue = asyncio.Queue(maxsize=1000)   # LLM results for final processing
         
-        # Enhanced timing and queue tracking
-        timing_stats = {
-            'channel_discovery_times': [],
-            'transcript_times': [],
-            'llm_times': [],
-            'total_times': [],
-            'queue_depths': {
-                'channel': [],
-                'video': [],
-                'llm': [],
-                'result': []
-            },
-            'timestamps': []
-        }
+        # Initialize YouTube analyzer
+        youtube_analyzer = YouTubeAnalyzer()
         
-        # Start all channel URLs for discovery
-        logger.info(f"📋 Queuing all {len(urls)} channel URLs for video discovery")
+        # Initialize LLM analyzer
+        actual_provider = os.getenv("LLM_PROVIDER", "local")
+        llm_analyzer = LLMAnalyzer(provider=actual_provider)
+        
+        # Queue all URLs for channel discovery
         for url in urls:
             await channel_queue.put({
                 'url': url,
-                'video_limit': video_limit,
-                'start_time': time.time()
+                'video_limit': video_limit
             })
         
-        # Capture initial queue state
+        # Track initial queue size
         initial_channel_size = channel_queue.qsize()
-        logger.info(f"📊 Initial queue state: Channels={initial_channel_size}, Videos=0, LLM=0, Result=0")
+        logger.info(f"📊 Pipeline initialized with {initial_channel_size} channels to process")
         
-        # Record initial queue depths
-        timing_stats['queue_depths']['channel'].append(initial_channel_size)
-        timing_stats['queue_depths']['video'].append(0)
-        timing_stats['queue_depths']['llm'].append(0)
-        timing_stats['queue_depths']['result'].append(0)
-        timing_stats['timestamps'].append(time.time())
+        # Create workers for each stage
+        workers = []
         
-        # Start workers
+        # Channel discovery workers (2 workers)
         channel_workers = []
-        video_workers = []
-        llm_workers = []
-        result_workers = []
-        
-        # 8 channel discovery workers (fast, just fetching video lists)
-        for i in range(8):
+        for i in range(2):
             worker = asyncio.create_task(
-                channel_discovery_worker(i, channel_queue, video_queue, youtube_analyzer, timing_stats, job_id)
+                channel_discovery_worker(i, channel_queue, controversy_queue, youtube_analyzer, timing_stats, job_id)
             )
+            workers.append(worker)
             channel_workers.append(worker)
         
-        # 5 video transcript workers (rate-limited, fetching individual video transcripts)
-        for i in range(5):
+        # Controversy screening workers (2 workers)
+        controversy_workers = []
+        for i in range(2):
+            worker = asyncio.create_task(
+                controversy_screening_worker(i, controversy_queue, video_queue, llm_analyzer, timing_stats, job_id)
+            )
+            workers.append(worker)
+            controversy_workers.append(worker)
+        
+        # Video transcript workers (4 workers)
+        transcript_workers = []
+        for i in range(4):
             worker = asyncio.create_task(
                 video_transcript_worker(i, video_queue, llm_queue, youtube_analyzer, timing_stats, job_id)
             )
-            video_workers.append(worker)
+            workers.append(worker)
+            transcript_workers.append(worker)
         
-        # 10 LLM workers (process individual video transcripts)
-        for i in range(10):
+        # LLM analysis workers (3 workers)
+        llm_workers = []
+        for i in range(3):
             worker = asyncio.create_task(
                 llm_worker(i, llm_queue, result_queue, llm_analyzer, timing_stats, job_id)
             )
+            workers.append(worker)
             llm_workers.append(worker)
         
-        # 5 result workers (aggregate video results by channel)
-        for i in range(5):
-            worker = asyncio.create_task(
-                result_worker(i, result_queue, timing_stats, job_id)
-            )
-            result_workers.append(worker)
+        # Result processing worker (1 worker)
+        result_worker_task = asyncio.create_task(
+            result_worker(0, result_queue, timing_stats, job_id)
+        )
+        workers.append(result_worker_task)
         
-        # Track all worker tasks for cancellation
-        all_workers = channel_workers + video_workers + llm_workers + result_workers
-        if job_id in active_job_tasks:
-            active_job_tasks[job_id].extend(all_workers)
-        else:
-            active_job_tasks[job_id] = all_workers
-        
-        # Monitor progress and queue depths with enhanced tracking
+        # Monitor pipeline progress
         monitor_task = asyncio.create_task(
-            monitor_pipeline_detailed(job_id, channel_queue, video_queue, llm_queue, result_queue, len(urls), timing_stats)
+            monitor_pipeline_detailed(job_id, channel_queue, controversy_queue, video_queue, llm_queue, result_queue, len(urls), timing_stats)
         )
         
-        # Wait for all work to complete
-        logger.info("⏳ Waiting for all channel discovery to complete...")
+        # Track all tasks for cancellation
+        if job_id not in active_job_tasks:
+            active_job_tasks[job_id] = []
+        active_job_tasks[job_id].extend(workers + [monitor_task])
+        
+        # Wait for all queues to be processed
         await channel_queue.join()
+        logger.info(f"✅ All channels discovered for job {job_id}")
         
-        logger.info("⏳ Waiting for all video transcript work to complete...")
+        await controversy_queue.join()
+        logger.info(f"✅ All controversy screening completed for job {job_id}")
+        
         await video_queue.join()
+        logger.info(f"✅ All video transcripts fetched for job {job_id}")
         
-        logger.info("⏳ Waiting for all LLM work to complete...")
         await llm_queue.join()
+        logger.info(f"✅ All LLM analyses completed for job {job_id}")
         
-        logger.info("⏳ Waiting for all result work to complete...")
         await result_queue.join()
+        logger.info(f"✅ All results processed for job {job_id}")
         
-        # Cancel workers and monitor
-        for workers in [channel_workers, video_workers, llm_workers, result_workers]:
-            for worker in workers:
-                worker.cancel()
+        # Cancel all workers
+        for worker in workers:
+            worker.cancel()
         monitor_task.cancel()
+        
+        # Wait for all cancelled tasks to finish
+        await asyncio.gather(*workers, monitor_task, return_exceptions=True)
         
         # Wait a moment for final monitoring data
         await asyncio.sleep(0.5)
         
-        # Calculate comprehensive final statistics
-        total_time = time.time() - start_time
+        # Calculate final statistics
         successful = len(analysis_results[job_id]['results'])
         failed = len(analysis_results[job_id]['failed_urls'])
         total_processed = successful + failed
         
-        # Log comprehensive final statistics
         logger.info("=" * 100)
         logger.info(f"🏁 FINAL STATISTICS for job {job_id}")
         logger.info("=" * 100)
@@ -1467,95 +1500,6 @@ async def process_creators_pipeline(job_id: str, urls: List[str], video_limit: i
         logger.info(f"   └─ URLs processed: {total_processed}")
         logger.info(f"   └─ ✅ Successful: {successful}")
         logger.info(f"   └─ ❌ Failed: {failed}")
-        logger.info(f"   └─ ⏱️  Total time: {total_time:.2f}s")
-        logger.info(f"   └─ 🚀 Throughput: {total_processed/total_time:.2f} URLs/sec")
-        
-        # Timing analysis
-        if timing_stats['channel_discovery_times']:
-            discovery_times = sorted(timing_stats['channel_discovery_times'])
-            discovery_p50 = discovery_times[len(discovery_times)//2]
-            discovery_p95 = discovery_times[int(len(discovery_times)*0.95)]
-            logger.info(f"📈 CHANNEL DISCOVERY TIMING:")
-            logger.info(f"   └─ Count: {len(discovery_times)} operations")
-            logger.info(f"   └─ P50: {discovery_p50:.2f}s | P95: {discovery_p95:.2f}s")
-            logger.info(f"   └─ Min: {min(discovery_times):.2f}s | Max: {max(discovery_times):.2f}s")
-        
-        if timing_stats['transcript_times']:
-            transcript_times = sorted(timing_stats['transcript_times'])
-            transcript_p50 = transcript_times[len(transcript_times)//2]
-            transcript_p95 = transcript_times[int(len(transcript_times)*0.95)]
-            logger.info(f"📈 VIDEO TRANSCRIPT TIMING:")
-            logger.info(f"   └─ Count: {len(transcript_times)} operations")
-            logger.info(f"   └─ P50: {transcript_p50:.2f}s | P95: {transcript_p95:.2f}s")
-            logger.info(f"   └─ Min: {min(transcript_times):.2f}s | Max: {max(transcript_times):.2f}s")
-        
-        if timing_stats['llm_times']:
-            llm_times = sorted(timing_stats['llm_times'])
-            llm_p50 = llm_times[len(llm_times)//2]
-            llm_p95 = llm_times[int(len(llm_times)*0.95)]
-            logger.info(f"🤖 LLM ANALYSIS TIMING:")
-            logger.info(f"   └─ Count: {len(llm_times)} operations")
-            logger.info(f"   └─ P50: {llm_p50:.2f}s | P95: {llm_p95:.2f}s")
-            logger.info(f"   └─ Min: {min(llm_times):.2f}s | Max: {max(llm_times):.2f}s")
-        
-        # Queue depth analysis for bottleneck identification
-        if timing_stats['queue_depths']['channel']:
-            channel_depths = timing_stats['queue_depths']['channel']
-            video_depths = timing_stats['queue_depths']['video']
-            llm_depths = timing_stats['queue_depths']['llm']
-            result_depths = timing_stats['queue_depths']['result']
-            
-            logger.info(f"📊 QUEUE DEPTH ANALYSIS:")
-            logger.info(f"   📋 Discovery Queue:")
-            logger.info(f"      └─ Avg: {sum(channel_depths)/len(channel_depths):.1f} | Max: {max(channel_depths)} | Min: {min(channel_depths)}")
-            logger.info(f"   🎬 Transcript Queue:")
-            logger.info(f"      └─ Avg: {sum(video_depths)/len(video_depths):.1f} | Max: {max(video_depths)} | Min: {min(video_depths)}")
-            logger.info(f"   🤖 LLM Queue:")
-            logger.info(f"      └─ Avg: {sum(llm_depths)/len(llm_depths):.1f} | Max: {max(llm_depths)} | Min: {min(llm_depths)}")
-            logger.info(f"   📝 Result Queue:")
-            logger.info(f"      └─ Avg: {sum(result_depths)/len(result_depths):.1f} | Max: {max(result_depths)} | Min: {min(result_depths)}")
-            
-            # Bottleneck analysis
-            avg_channel = sum(channel_depths)/len(channel_depths) if channel_depths else 0
-            avg_video = sum(video_depths)/len(video_depths) if video_depths else 0
-            avg_llm = sum(llm_depths)/len(llm_depths) if llm_depths else 0
-            avg_result = sum(result_depths)/len(result_depths) if result_depths else 0
-            
-            logger.info(f"🔍 BOTTLENECK ANALYSIS:")
-            max_avg = max(avg_channel, avg_video, avg_llm, avg_result)
-            if avg_video > max(avg_channel, avg_llm, avg_result) * 1.5:
-                logger.info(f"   └─ 🚨 TRANSCRIPT stage is the bottleneck (avg queue: {avg_video:.1f})")
-                logger.info(f"      └─ Consider adding more video transcript workers or reducing rate limiting")
-            elif avg_llm > max(avg_channel, avg_video, avg_result) * 1.5:
-                logger.info(f"   └─ 🚨 LLM stage is the bottleneck (avg queue: {avg_llm:.1f})")
-                logger.info(f"      └─ Consider adding more LLM workers or optimizing prompts")
-            elif avg_result > max(avg_channel, avg_video, avg_llm) * 1.5:
-                logger.info(f"   └─ 🚨 RESULT stage is the bottleneck (avg queue: {avg_result:.1f})")
-                logger.info(f"      └─ Consider adding more result workers")
-            else:
-                logger.info(f"   └─ ✅ No significant bottlenecks detected - balanced pipeline")
-        
-        # Error analysis
-        if failed > 0:
-            error_types = {}
-            for failed_url in analysis_results[job_id]['failed_urls']:
-                error_type = failed_url.get('error_type', 'unknown')
-                error_types[error_type] = error_types.get(error_type, 0) + 1
-            
-            logger.info(f"❌ ERROR ANALYSIS:")
-            for error_type, count in sorted(error_types.items(), key=lambda x: x[1], reverse=True):
-                logger.info(f"   └─ {error_type}: {count} failures")
-        
-        # Log any discrepancies
-        if total_processed != len(urls):
-            logger.error(f"🚨 DISCREPANCY DETECTED:")
-            logger.error(f"   └─ Expected: {len(urls)} URLs")
-            logger.error(f"   └─ Processed: {total_processed} URLs")
-            logger.error(f"   └─ Missing: {len(urls) - total_processed} URLs")
-        else:
-            logger.info(f"✅ PROCESSING COMPLETE: All {len(urls)} URLs accounted for")
-        
-        logger.info("=" * 100)
         
         # Mark job as complete
         analysis_results[job_id]['status'] = 'completed'
@@ -1568,13 +1512,21 @@ async def process_creators_pipeline(job_id: str, urls: List[str], video_limit: i
         # Clean up task tracking
         if job_id in active_job_tasks:
             del active_job_tasks[job_id]
-        
+            
     except Exception as e:
         logger.error(f"💥 Error in pipeline processing: {str(e)}")
         if job_id in analysis_results:
             analysis_results[job_id]['status'] = 'failed'
             analysis_results[job_id]['error'] = str(e)
             analysis_results[job_id]['completed_at'] = datetime.now().isoformat()
+            
+            # Cancel and clean up any running workers
+            if 'workers' in locals():
+                for worker in workers:
+                    worker.cancel()
+                if 'monitor_task' in locals():
+                    monitor_task.cancel()
+                await asyncio.gather(*workers, monitor_task, return_exceptions=True)
             
             # Clean up task tracking on failure
             if job_id in active_job_tasks:
@@ -1669,7 +1621,7 @@ async def create_channel_summaries(job_id: str):
     except Exception as e:
         logger.error(f"💥 Error creating channel summaries: {str(e)}")
 
-async def channel_discovery_worker(worker_id: int, channel_queue: asyncio.Queue, video_queue: asyncio.Queue, 
+async def channel_discovery_worker(worker_id: int, channel_queue: asyncio.Queue, controversy_queue: asyncio.Queue,
                                   youtube_analyzer, timing_stats: dict, job_id: str):
     """Worker that discovers videos in channels and feeds individual videos to video queue"""
     while True:
@@ -1685,7 +1637,7 @@ async def channel_discovery_worker(worker_id: int, channel_queue: asyncio.Queue,
             video_limit = item['video_limit']
             start_time = time.time()
             
-            # Update pipeline stage: queued -> fetching
+            # Update pipeline stage: queued -> discovering
             update_pipeline_stage(job_id, 'queued_for_discovery', 'discovering_videos')
             
             logger.debug(f"📋 Channel Worker {worker_id}: Discovering videos for {url}")
@@ -1697,7 +1649,7 @@ async def channel_discovery_worker(worker_id: int, channel_queue: asyncio.Queue,
                 error_msg = f"Failed to access YouTube channel. The URL may be invalid, private, or the channel may not exist: {url}"
                 logger.warning(f"❌ Channel Worker {worker_id}: Invalid channel URL - {url}")
                 
-                # Update pipeline stage: fetching -> failed
+                # Update pipeline stage: discovering -> failed
                 update_pipeline_stage(job_id, 'discovering_videos', 'failed')
                 
                 analysis_results[job_id]['failed_urls'].append({
@@ -1705,79 +1657,51 @@ async def channel_discovery_worker(worker_id: int, channel_queue: asyncio.Queue,
                     'error': error_msg,
                     'error_type': 'invalid_channel'
                 })
-                # CRITICAL: Mark task as done!
+                # Mark task as done
                 channel_queue.task_done()
+                logger.debug(f"📋 Channel Worker {worker_id}: Marked invalid channel as done (queue size: {channel_queue.qsize()})")
             else:
-                # Pre-screen for controversies
-                llm_analyzer = LLMAnalyzer(provider=os.getenv("LLM_PROVIDER", "local"))
-                is_controversial, controversy_reason = await screen_creator_for_controversy(
-                    channel_name or "Unknown", 
-                    channel_handle or "Unknown",
-                    llm_analyzer
-                )
+                # Get video list from channel
+                videos = youtube_analyzer.get_videos_from_channel(channel_id, limit=video_limit)
                 
-                if is_controversial:
-                    logger.warning(f"🚫 Channel Worker {worker_id}: Creator {channel_name} flagged for controversy: {controversy_reason}")
+                if not videos:
+                    error_msg = f"Channel '{channel_name or 'Unknown'}' has no videos available for analysis"
+                    logger.warning(f"❌ Channel Worker {worker_id}: No videos found for {url}")
                     
                     # Update pipeline stage: discovering -> failed
                     update_pipeline_stage(job_id, 'discovering_videos', 'failed')
                     
-                    # Add to failed URLs with high controversy score
                     analysis_results[job_id]['failed_urls'].append({
                         'url': url,
-                        'error': f"Creator flagged for ongoing controversy: {controversy_reason}",
-                        'error_type': 'controversy_flagged',
-                        'channel_name': channel_name or 'Unknown',
-                        'channel_id': channel_id,
-                        'controversy_score': 1.0  # Maximum controversy score
+                        'error': error_msg,
+                        'error_type': 'no_videos',
+                        'channel_name': channel_name or 'Unknown'
                     })
-                    # CRITICAL: Mark task as done!
+                    # Mark task as done
                     channel_queue.task_done()
+                    logger.debug(f"📋 Channel Worker {worker_id}: Marked no-videos channel as done (queue size: {channel_queue.qsize()})")
                 else:
-                    # Get video list from channel
-                    videos = youtube_analyzer.get_videos_from_channel(channel_id, limit=video_limit)
+                    discovery_time = time.time() - start_time
+                    timing_stats['channel_discovery'].append(discovery_time)
                     
-                    if not videos:
-                        error_msg = f"Channel '{channel_name or 'Unknown'}' has no videos available for analysis"
-                        logger.warning(f"❌ Channel Worker {worker_id}: No videos found for {url}")
-                        
-                        # Update pipeline stage: fetching -> failed
-                        update_pipeline_stage(job_id, 'discovering_videos', 'failed')
-                        
-                        analysis_results[job_id]['failed_urls'].append({
-                            'url': url,
-                            'error': error_msg,
-                            'error_type': 'no_videos',
-                            'channel_name': channel_name or 'Unknown'
-                        })
-                        # CRITICAL: Mark task as done!
-                        channel_queue.task_done()
-                    else:
-                        discovery_time = time.time() - start_time
-                        timing_stats['channel_discovery_times'].append(discovery_time)
-                        
-                        logger.debug(f"✅ Channel Worker {worker_id}: Found {len(videos)} videos for {url} in {discovery_time:.2f}s")
-                        
-                        # Add each video to video queue for transcript processing
-                        for video in videos:
-                            # Update pipeline stage: fetching -> queued for transcripts
-                            update_pipeline_stage(job_id, 'discovering_videos', 'queued_for_transcripts')
-                            
-                            # Update video discovery count
-                            analysis_results[job_id]['video_progress']['total_videos_discovered'] += 1
-                            
-                            await video_queue.put({
-                                'url': url,  # Original channel URL
-                                'video_id': video['id'],
-                                'video_title': video['title'],
-                                'video_url': video['url'],
-                                'channel_id': channel_id,
-                                'channel_name': channel_name,
-                                'channel_handle': channel_handle,
-                                'start_time': time.time()
-                            })
-                        # Mark task as done after all videos are queued
-            channel_queue.task_done()
+                    logger.debug(f"✅ Channel Worker {worker_id}: Found {len(videos)} videos for {url} in {discovery_time:.2f}s")
+                    
+                    # Update pipeline stage: discovering -> queued for controversy
+                    update_pipeline_stage(job_id, 'discovering_videos', 'queued_for_controversy')
+                    
+                    # Pass channel data to controversy screening queue
+                    await controversy_queue.put({
+                        'url': url,
+                        'channel_id': channel_id,
+                        'channel_name': channel_name,
+                        'channel_handle': channel_handle,
+                        'videos': videos,
+                        'start_time': time.time()
+                    })
+                    
+                    # Mark task as done
+                    channel_queue.task_done()
+                    logger.debug(f"📋 Channel Worker {worker_id}: Queued channel for controversy screening (queue size: {channel_queue.qsize()})")
             
         except asyncio.CancelledError:
             break
@@ -1787,7 +1711,7 @@ async def channel_discovery_worker(worker_id: int, channel_queue: asyncio.Queue,
             
             logger.error(f"💥 Channel discovery worker {worker_id} error processing {url}: {e}")
             
-            # Update pipeline stage: fetching -> failed
+            # Update pipeline stage: discovering -> failed
             update_pipeline_stage(job_id, 'discovering_videos', 'failed')
             
             # Add to failed URLs with clear messaging
@@ -1797,6 +1721,128 @@ async def channel_discovery_worker(worker_id: int, channel_queue: asyncio.Queue,
                 'error_type': 'channel_discovery_error'
             })
             channel_queue.task_done()
+
+async def controversy_screening_worker(worker_id: int, controversy_queue: asyncio.Queue, video_queue: asyncio.Queue,
+                                      llm_analyzer, timing_stats: dict, job_id: str):
+    """Worker that screens channels for controversies before processing videos"""
+    while True:
+        try:
+            # Check if job is cancelled
+            if is_job_cancelled(job_id):
+                logger.info(f"🔍 Controversy Worker {worker_id}: Job {job_id} cancelled, stopping...")
+                break
+                
+            # Get work item
+            item = await controversy_queue.get()
+            url = item['url']
+            channel_name = item['channel_name']
+            channel_handle = item['channel_handle']
+            channel_id = item['channel_id']
+            videos = item['videos']
+            start_time = time.time()
+            
+            # Update pipeline stage: queued for controversy -> screening
+            update_pipeline_stage(job_id, 'queued_for_controversy', 'screening_controversy')
+            
+            logger.debug(f"🔍 Controversy Worker {worker_id}: Screening {channel_name} for controversies")
+            
+            # Screen for controversies
+            is_controversial, controversy_reason = await screen_creator_for_controversy(
+                channel_name or "Unknown", 
+                channel_handle or "Unknown",
+                llm_analyzer
+            )
+            
+            screening_time = time.time() - start_time
+            timing_stats['controversy_screening'].append(screening_time)
+            
+            if is_controversial:
+                logger.warning(f"🚫 Controversy Worker {worker_id}: Creator {channel_name} flagged for controversy: {controversy_reason}")
+                
+                # Update pipeline stage: screening -> failed
+                update_pipeline_stage(job_id, 'screening_controversy', 'failed')
+                
+                # Add to failed URLs with high controversy score
+                analysis_results[job_id]['failed_urls'].append({
+                    'url': url,
+                    'error': f"Creator flagged for ongoing controversy: {controversy_reason}",
+                    'error_type': 'controversy_flagged',
+                    'channel_name': channel_name or 'Unknown',
+                    'channel_id': channel_id,
+                    'controversy_score': 1.0,  # Maximum controversy score
+                    'controversy_reason': controversy_reason
+                })
+            else:
+                logger.debug(f"✅ Controversy Worker {worker_id}: {channel_name} passed controversy screening in {screening_time:.2f}s")
+                
+                # Add each video to video queue for transcript processing
+                for video in videos:
+                    # Update pipeline stage: screening -> queued for transcripts
+                    update_pipeline_stage(job_id, 'screening_controversy', 'queued_for_transcripts')
+                    
+                    # Update video discovery count
+                    analysis_results[job_id]['video_progress']['total_videos_discovered'] += 1
+                    
+                    await video_queue.put({
+                        'url': url,  # Original channel URL
+                        'video_id': video['id'],
+                        'video_title': video['title'],
+                        'video_url': video['url'],
+                        'channel_id': channel_id,
+                        'channel_name': channel_name,
+                        'channel_handle': channel_handle,
+                        'start_time': time.time()
+                    })
+            
+            # Mark task as done
+            controversy_queue.task_done()
+            
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            url = item.get('url', 'unknown') if 'item' in locals() else 'unknown'
+            channel_name = item.get('channel_name', 'Unknown') if 'item' in locals() else 'Unknown'
+            
+            logger.error(f"💥 Controversy screening worker {worker_id} error processing {url}: {e}")
+            
+            # Update pipeline stage: screening -> controversy check failed (but continue)
+            update_pipeline_stage(job_id, 'screening_controversy', 'controversy_check_failed')
+            
+            # Log the failure but continue processing the channel
+            logger.warning(f"⚠️ Controversy Worker {worker_id}: Failed to screen {channel_name}, continuing with video processing")
+            
+            # Add a note to the channel that controversy check failed
+            if url not in analysis_results[job_id].get('controversy_check_failures', {}):
+                if 'controversy_check_failures' not in analysis_results[job_id]:
+                    analysis_results[job_id]['controversy_check_failures'] = {}
+                analysis_results[job_id]['controversy_check_failures'][url] = {
+                    'channel_name': channel_name,
+                    'error': str(e),
+                    'timestamp': datetime.now().isoformat()
+                }
+            
+            # Still queue the videos for processing despite controversy check failure
+            if 'item' in locals() and 'videos' in item:
+                for video in item['videos']:
+                    # Update pipeline stage: screening -> queued for transcripts
+                    update_pipeline_stage(job_id, 'screening_controversy', 'queued_for_transcripts')
+                    
+                    # Update video discovery count
+                    analysis_results[job_id]['video_progress']['total_videos_discovered'] += 1
+                    
+                    await video_queue.put({
+                        'url': url,
+                        'video_id': video['id'],
+                        'video_title': video['title'],
+                        'video_url': video['url'],
+                        'channel_id': item.get('channel_id', 'unknown'),
+                        'channel_name': channel_name,
+                        'channel_handle': item.get('channel_handle', 'Unknown'),
+                        'start_time': time.time(),
+                        'controversy_check_failed': True  # Flag that controversy check failed
+                    })
+            
+            controversy_queue.task_done()
 
 async def video_transcript_worker(worker_id: int, video_queue: asyncio.Queue, llm_queue: asyncio.Queue,
                                  youtube_analyzer, timing_stats: dict, job_id: str):
@@ -1842,7 +1888,7 @@ async def video_transcript_worker(worker_id: int, video_queue: asyncio.Queue, ll
             transcript = await youtube_analyzer.get_transcript_async(video_id)
             
             transcript_time = time.time() - start_time
-            timing_stats['transcript_times'].append(transcript_time)
+            timing_stats['transcript_fetch'].append(transcript_time)
             
             if transcript:
                 # Check if we got a rate limit error
@@ -1952,7 +1998,7 @@ async def llm_worker(worker_id: int, llm_queue: asyncio.Queue, result_queue: asy
             analysis_result = await llm_analyzer.analyze_video_content_async(video_data)
             
             llm_time = time.time() - start_time
-            timing_stats['llm_times'].append(llm_time)
+            timing_stats['llm_analysis'].append(llm_time)
             
             # Update video progress tracking
             analysis_results[job_id]['video_progress']['videos_analyzed_by_llm'] += 1
@@ -2088,7 +2134,7 @@ async def result_worker(worker_id: int, result_queue: asyncio.Queue, timing_stat
             
             result_queue.task_done()
 
-async def monitor_pipeline_detailed(job_id: str, channel_queue: asyncio.Queue, video_queue: asyncio.Queue, 
+async def monitor_pipeline_detailed(job_id: str, channel_queue: asyncio.Queue, controversy_queue: asyncio.Queue, video_queue: asyncio.Queue, 
                                    llm_queue: asyncio.Queue, result_queue: asyncio.Queue, total_urls: int, timing_stats: dict):
     """Monitor queue depths and progress with enhanced tracking"""
     monitor_start = time.time()
@@ -2105,6 +2151,7 @@ async def monitor_pipeline_detailed(job_id: str, channel_queue: asyncio.Queue, v
             elapsed = current_time - monitor_start
             
             channel_size = channel_queue.qsize()
+            controversy_size = controversy_queue.qsize()
             video_size = video_queue.qsize() 
             llm_size = llm_queue.qsize()
             result_size = result_queue.qsize()
@@ -2115,10 +2162,21 @@ async def monitor_pipeline_detailed(job_id: str, channel_queue: asyncio.Queue, v
             
             # Always log basic status
             progress_pct = (processed/total_urls*100) if total_urls > 0 else 0
-            logger.info(f"📊 D:{channel_size:2d} | T:{video_size:2d} | L:{llm_size:2d} | R:{result_size:2d} | {processed:3d}/{total_urls} ({progress_pct:5.1f}%) | {elapsed:6.1f}s elapsed")
+            logger.info(f"📊 D:{channel_size:2d} | C:{controversy_size:2d} | T:{video_size:2d} | L:{llm_size:2d} | R:{result_size:2d} | {processed:3d}/{total_urls} ({progress_pct:5.1f}%) | {elapsed:6.1f}s elapsed")
             
             # Update queue depths for analysis
+            if 'queue_depths' not in timing_stats:
+                timing_stats['queue_depths'] = {
+                    'channel': [],
+                    'controversy': [],
+                    'video': [],
+                    'llm': [],
+                    'result': []
+                }
+                timing_stats['timestamps'] = []
+            
             timing_stats['queue_depths']['channel'].append(channel_size)
+            timing_stats['queue_depths']['controversy'].append(controversy_size)
             timing_stats['queue_depths']['video'].append(video_size)
             timing_stats['queue_depths']['llm'].append(llm_size)
             timing_stats['queue_depths']['result'].append(result_size)
@@ -2135,6 +2193,7 @@ async def monitor_pipeline_detailed(job_id: str, channel_queue: asyncio.Queue, v
                     
                     # Debug current max values
                     current_max_c = max(timing_stats['queue_depths']['channel'], default=0)
+                    current_max_cont = max(timing_stats['queue_depths']['controversy'], default=0)
                     current_max_v = max(timing_stats['queue_depths']['video'], default=0)
                     current_max_l = max(timing_stats['queue_depths']['llm'], default=0)
                     current_max_r = max(timing_stats['queue_depths']['result'], default=0)
@@ -2142,15 +2201,11 @@ async def monitor_pipeline_detailed(job_id: str, channel_queue: asyncio.Queue, v
                     logger.info(f"📈 DETAILED STATUS:")
                     logger.info(f"   └─ Processing rate: {rate:.2f} URLs/sec")
                     logger.info(f"   └─ ETA: {eta_minutes:.1f} minutes ({eta_seconds:.0f}s)")
-                    logger.info(f"   └─ Queue depths - Max seen: D:{current_max_c} | T:{current_max_v} | L:{current_max_l} | R:{current_max_r}")
-                    logger.info(f"   └─ Debug: Stats collected: {len(timing_stats['queue_depths']['channel'])} data points")
-                    logger.info(f"   └─ Debug: Recent D depths={timing_stats['queue_depths']['channel'][-5:]} (last 5)")
-                    logger.info(f"   └─ Debug: Recent T depths={timing_stats['queue_depths']['video'][-5:]} (last 5)")
-                    logger.info(f"   └─ Debug: Recent L depths={timing_stats['queue_depths']['llm'][-5:]} (last 5)")
-                    logger.info(f"   └─ Debug: Recent R depths={timing_stats['queue_depths']['result'][-5:]} (last 5)")
+                    logger.info(f"   └─ Queue depths - Max seen: D:{current_max_c} | C:{current_max_cont} | T:{current_max_v} | L:{current_max_l} | R:{current_max_r}")
+                    logger.info(f"   └─ Pipeline stages: {analysis_results[job_id]['pipeline_stages']}")
             
             # If all work is done, break
-            if processed >= total_urls and channel_size == 0 and video_size == 0 and llm_size == 0 and result_size == 0:
+            if processed >= total_urls and channel_size == 0 and controversy_size == 0 and video_size == 0 and llm_size == 0 and result_size == 0:
                 logger.info("🏁 All work completed, stopping monitor")
                 logger.info(f"📊 Final monitoring stats: {len(timing_stats['queue_depths']['channel'])} data points collected over {elapsed:.1f}s")
                 break
@@ -2167,6 +2222,8 @@ async def screen_creator_for_controversy(channel_name: str, channel_handle: str,
     Returns (is_controversial, reason)
     """
     try:
+        logger.info(f"🔍 CONTROVERSY CHECK: Screening creator - Name: '{channel_name}', Handle: '{channel_handle}'")
+        
         # Create a prompt to check for ongoing controversies
         prompt = f"""
         You are a content moderation assistant. Your task is to determine if a YouTube creator is currently involved in any significant ongoing controversies.
@@ -2176,29 +2233,66 @@ async def screen_creator_for_controversy(channel_name: str, channel_handle: str,
         - Channel Handle: {channel_handle}
         
         Check if this creator is currently involved in any of the following:
-        1. Major public scandals or controversies
-        2. Legal issues or criminal investigations
-        3. Serious allegations of misconduct
-        4. Significant community backlash for harmful behavior
+        1. Major public scandals or controversies that are CURRENTLY ACTIVE (within the last 6 months)
+        2. Active legal issues, criminal investigations, or ongoing court cases
+        3. Recent serious allegations of misconduct that are still being investigated or discussed
+        4. Significant community backlash for harmful behavior that is ONGOING
+        5. Recent content that has led to platform strikes, demonetization, or channel warnings
         
-        Important: Only flag creators with CURRENT, ONGOING, and SIGNIFICANT controversies. Historical issues that have been resolved should not be flagged.
+        Important guidelines:
+        - Only flag creators with CURRENT, ONGOING, and SIGNIFICANT controversies
+        - Historical issues that have been resolved should NOT be flagged
+        - Minor disagreements or typical internet drama should NOT be flagged
+        - Educational content about controversial topics should NOT be flagged
+        - Political opinions or religious views should NOT be flagged unless they involve hate speech
+        - Be specific about the timeframe - controversies must be recent and ongoing
+        
+        Known controversial creators to flag (if matched):
+        - Creators currently facing criminal charges
+        - Creators with active investigations for serious misconduct
+        - Creators who have been banned from major platforms in the last 6 months
+        - Creators involved in ongoing legal disputes about harmful content
         
         Respond with a JSON object:
         {{
             "is_controversial": true/false,
-            "reason": "Brief explanation if controversial, or 'No ongoing controversies found' if not"
+            "reason": "Brief explanation if controversial, or 'No ongoing controversies found' if not",
+            "confidence": "high/medium/low"
         }}
+        
+        Be conservative - only flag if you are confident there is a significant ongoing controversy.
         """
+        
+        logger.debug(f"🔍 CONTROVERSY CHECK: Sending prompt to LLM for {channel_name}")
         
         # Use the LLM to check
         response = await llm_analyzer.check_controversy_async(prompt)
         
-        if response and isinstance(response, dict):
-            return response.get('is_controversial', False), response.get('reason', 'Unknown')
+        logger.info(f"🔍 CONTROVERSY CHECK: LLM Response for {channel_name}: {response}")
         
-        return False, "No ongoing controversies found"
+        if response and isinstance(response, dict):
+            # Only flag if confidence is high or medium
+            confidence = response.get('confidence', 'low')
+            if confidence == 'low':
+                logger.info(f"🔍 CONTROVERSY CHECK: Low confidence for {channel_name}, not flagging")
+                return False, "Low confidence in controversy assessment"
+            
+            is_controversial = response.get('is_controversial', False)
+            reason = response.get('reason', 'Unknown')
+            
+            # Log the decision for debugging
+            if is_controversial:
+                logger.info(f"🚫 Controversy check: {channel_name} flagged with {confidence} confidence - {reason}")
+            else:
+                logger.info(f"✅ Controversy check: {channel_name} passed screening with {confidence} confidence")
+            
+            return is_controversial, reason
+        
+        # Default to not controversial if check fails
+        logger.warning(f"Controversy check returned invalid response for {channel_name}, defaulting to not controversial")
+        return False, "Controversy check returned invalid response"
         
     except Exception as e:
-        logger.warning(f"Failed to screen creator {channel_name} for controversies: {str(e)}")
-        # On error, don't block the creator
-        return False, "Screening check failed"
+        logger.error(f"Failed to screen creator {channel_name} for controversies: {str(e)}", exc_info=True)
+        # On error, log but don't block the creator
+        return False, f"Controversy screening check failed: {str(e)}"
