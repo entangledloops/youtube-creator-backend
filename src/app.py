@@ -35,6 +35,7 @@ from src.export_handlers import (
     download_bulk_analysis_evidence,
     download_failed_urls_csv
 )
+from src.pipeline_workers import calculate_job_eta
 
 # Configure logging
 logging.basicConfig(
@@ -173,9 +174,9 @@ async def analyze_creator(request: CreatorAnalysisRequest):
         if not channel_id:
             raise HTTPException(status_code=404, detail="Could not extract channel information from URL")
         
-        # Screen for controversies before proceeding
+        # Screen for controversies
         logger.info(f"🔍 Screening creator {channel_name} for controversies...")
-        is_controversial, controversy_reason = await screen_creator_for_controversy(
+        is_controversial, controversy_reason, controversy_status = await screen_creator_for_controversy(
             channel_name or "Unknown", 
             channel_handle or "Unknown",
             llm_analyzer
@@ -194,6 +195,7 @@ async def analyze_creator(request: CreatorAnalysisRequest):
                     "controversy_flagged": {
                         "flagged": True,
                         "reason": controversy_reason,
+                        "status": controversy_status,
                         "message": "This creator has been flagged for ongoing controversies and cannot be analyzed at this time."
                     }
                 },
@@ -471,172 +473,119 @@ async def bulk_analyze(
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/bulk-analyze/{job_id}/status")
-async def get_bulk_analysis_status_alias(job_id: str):
-    """Alias for get_bulk_analysis_status to match frontend expectations"""
-    logger.info(f"Status alias request for job_id: {job_id}")
-    return await get_bulk_analysis_status(job_id)
-
 async def get_bulk_analysis_status(job_id: str):
     """Get detailed status of a bulk analysis job with pipeline breakdown and ETA"""
-    if job_id not in analysis_results:
-        # Log available job IDs for debugging
-        available_jobs = list(analysis_results.keys())
-        logger.warning(f"Job {job_id} not found. Available jobs: {available_jobs}")
-        logger.warning(f"Total jobs in memory: {len(analysis_results)}")
+    try:
+        # Get job data
+        job = analysis_results.get(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
         
-        # Check if this might be an old job
-        if len(available_jobs) == 0:
-            logger.warning("No jobs in memory - server may have been restarted")
+        # Calculate progress percentages
+        total_urls = job['total_urls']
+        successful_count = len(job['results'])
+        failed_count = len(job['failed_urls'])
+        total_processed = successful_count + failed_count
+        channel_progress_percentage = (total_processed / total_urls * 100) if total_urls > 0 else 0
         
-        raise HTTPException(status_code=404, detail="Job not found")
+        # Calculate video progress
+        video_progress = job.get('video_progress', {})
+        total_videos = video_progress.get('total_videos_discovered', 0)
+        videos_with_transcripts = video_progress.get('videos_with_transcripts', 0)
+        videos_analyzed = video_progress.get('videos_analyzed_by_llm', 0)
+        videos_completed = video_progress.get('videos_completed', 0)
+        video_progress_percentage = (videos_completed / total_videos * 100) if total_videos > 0 else 0
         
-    job = analysis_results[job_id]
-    
-    # Calculate counts for status
-    successful_count = len(job['results'])
-    failed_count = len(job['failed_urls'])
-    total_processed = successful_count + failed_count
-    
-    # Get video-level progress for more accurate status
-    video_progress = job.get('video_progress', {})
-    total_videos = video_progress.get('total_videos_discovered', 0)
-    videos_completed = video_progress.get('videos_completed', 0)
-    videos_with_transcripts = video_progress.get('videos_with_transcripts', 0)
-    videos_analyzed = video_progress.get('videos_analyzed_by_llm', 0)
-    
-    # DEBUG: Log what we're seeing
-    logger.info(f"🔍 STATUS REQUEST DEBUG for job {job_id}:")
-    logger.info(f"   📊 Job status: {job['status']}")
-    logger.info(f"   📊 Successful channels: {successful_count}")
-    logger.info(f"   📊 Failed URLs: {failed_count}")
-    logger.info(f"   📊 Total processed: {total_processed}")
-    logger.info(f"   📊 Total URLs: {job['total_urls']}")
-    logger.info(f"   📊 Video Progress: {total_videos} discovered, {videos_with_transcripts} transcripts, {videos_analyzed} analyzed, {videos_completed} completed")
-    logger.info(f"   📊 Pipeline stages: {job.get('pipeline_stages', {})}")
-    
-    # Calculate progress based on video completion if we have video data
-    if total_videos > 0:
-        video_progress_percentage = (videos_completed / total_videos) * 100
-        effective_processed = videos_completed
-        effective_total = total_videos
+        # Calculate ETA using shared function
+        eta_info = calculate_job_eta(job)
         
-        # Channel progress should never exceed video progress
-        # Use video completion rate as a proxy for channel completion
-        channel_progress_percentage = video_progress_percentage
-    else:
-        # Fallback to channel-level progress when no video data available
-        video_progress_percentage = (total_processed / job['total_urls'] * 100) if job['total_urls'] > 0 else 0
-        channel_progress_percentage = video_progress_percentage
-        effective_processed = total_processed
-        effective_total = job['total_urls']
-    
-    # Calculate channel-level progress (separate from video progress)
-    channel_progress_percentage = (total_processed / job['total_urls'] * 100) if job['total_urls'] > 0 else 0
-    
-    # Calculate ETA if job is processing
-    eta_info = {}
-    if job['status'] == 'processing':
-        elapsed_time = time.time() - job['performance_stats']['overall_start_time']
+        # Get controversy check failures
+        controversy_failures = job.get('controversy_check_failures', {})
+        controversy_failed_count = sum(1 for f in controversy_failures.values() 
+                                     if f.get('status') in ['controversial', 'error'])
         
-        if effective_processed > 0:
-            # Calculate processing rate using effective progress
-            processing_rate_per_second = effective_processed / elapsed_time
-            processing_rate_per_minute = processing_rate_per_second * 60
+        # Get pipeline stages
+        pipeline_stages = job.get('pipeline_stages', {})
+        
+        # Update controversy check failed count to match actual failures
+        if 'controversy_check_failed' in pipeline_stages:
+            pipeline_stages['controversy_check_failed'] = controversy_failed_count
+        
+        # Build detailed response
+        response = {
+            "job_id": job_id,
+            "status": job['status'],
+            "started_at": job['started_at'],
+            "completed_at": job.get('completed_at'),
+            "total_urls": job['total_urls'],
+            "processed_urls": job['processed_urls'],
+            "api_version": __version__,  # Add version info
             
-            # Estimate remaining time
-            remaining_items = effective_total - effective_processed
-            estimated_seconds_remaining = remaining_items / processing_rate_per_second if processing_rate_per_second > 0 else 0
-            estimated_minutes_remaining = estimated_seconds_remaining / 60
+            # Basic progress info (for backward compatibility)
+            "progress": {
+                "successful": successful_count,
+                "failed": failed_count,
+                "total_processed": total_processed,
+                "percentage": channel_progress_percentage
+            },
             
-            # Update job performance stats
-            job['performance_stats']['processing_rate_per_minute'] = processing_rate_per_minute
-            job['performance_stats']['estimated_completion_time'] = (
-                datetime.now() + timedelta(seconds=estimated_seconds_remaining)
-            ).isoformat()
+            # Video-level progress details
+            "video_progress": {
+                "total_videos_discovered": total_videos,
+                "videos_with_transcripts": videos_with_transcripts,
+                "videos_analyzed_by_llm": videos_analyzed,
+                "videos_completed": videos_completed,
+                "video_percentage": video_progress_percentage
+            },
             
-            eta_info = {
-                "estimated_completion_time": job['performance_stats']['estimated_completion_time'],
-                "estimated_minutes_remaining": max(1, int(estimated_minutes_remaining)),
-                "processing_rate_per_minute": round(processing_rate_per_minute, 2),
-                "elapsed_minutes": round(elapsed_time / 60, 1),
-                "progress_type": "videos" if total_videos > 0 else "channels"
-            }
+            # Detailed pipeline stage breakdown
+            "pipeline_stages": pipeline_stages,
             
-            logger.info(f"   📊 ETA info: {eta_info}")
-        else:
-            eta_info = {
-                "estimated_completion_time": None,
-                "estimated_minutes_remaining": None,
-                "processing_rate_per_minute": 0,
-                "elapsed_minutes": round(elapsed_time / 60, 1),
-                "progress_type": "videos" if total_videos > 0 else "channels"
-            }
-            logger.info(f"   📊 ETA info (no progress yet): {eta_info}")
-    
-    # Build detailed response
-    response = {
-        "job_id": job_id,
-        "status": job['status'],
-        "started_at": job['started_at'],
-        "completed_at": job.get('completed_at'),
-        "total_urls": job['total_urls'],
-        "processed_urls": job['processed_urls'],
-        "api_version": __version__,  # Add version info
-        
-        # Basic progress info (for backward compatibility)
-        "progress": {
-            "successful": successful_count,
-            "failed": failed_count,
-            "total_processed": total_processed,
-            "percentage": channel_progress_percentage
-        },
-        
-        # Video-level progress details
-        "video_progress": {
-            "total_videos_discovered": total_videos,
-            "videos_with_transcripts": videos_with_transcripts,
-            "videos_analyzed_by_llm": videos_analyzed,
-            "videos_completed": videos_completed,
-            "video_percentage": video_progress_percentage
-        },
-        
-        # Detailed pipeline stage breakdown
-        "pipeline_stages": job.get('pipeline_stages', {}),
-        
-        # Controversy check failures (channels that were processed despite check failure)
-        "controversy_check_failures": len(job.get('controversy_check_failures', {})),
-        
-        # ETA and performance information
-        "eta": eta_info,
-        
-        # YouTube rate limiting stats
-        "youtube_stats": {
-            "total_transcript_requests": youtube_rate_limiter['total_transcript_requests'],
-            "total_api_calls": youtube_rate_limiter['total_api_calls'],
-            "currently_blocked": youtube_rate_limiter['blocked_until'] is not None and youtube_rate_limiter['blocked_until'] > time.time(),
-            "blocked_until": youtube_rate_limiter['blocked_until'] if youtube_rate_limiter['blocked_until'] and youtube_rate_limiter['blocked_until'] > time.time() else None,
-            "consecutive_blocks": youtube_rate_limiter['consecutive_blocks'],
-            "last_block_time": youtube_rate_limiter['last_block_time']
-        },
-        
-        # Queue information (if applicable)
-        "queue_info": {}
-    }
-    
-    # Add queue information for queued jobs
-    if job['status'] == 'queued':
-        response["queue_info"] = {
-            "queue_position": job.get('queue_position', 0),
-            "estimated_wait_minutes": job.get('estimated_wait_minutes', 0),
-            "estimated_start_time": job.get('estimated_start_time'),
-            "message": f"Your job is queued at position {job.get('queue_position', 0)}. Estimated wait time: {job.get('estimated_wait_minutes', 0)} minutes."
+            # Controversy check failures (channels that were processed despite check failure)
+            "controversy_check_failures": {
+                "total": len(controversy_failures),
+                "by_status": {
+                    "controversial": sum(1 for f in controversy_failures.values() if f.get('status') == 'controversial'),
+                    "error": sum(1 for f in controversy_failures.values() if f.get('status') == 'error'),
+                    "not_controversial": sum(1 for f in controversy_failures.values() if f.get('status') == 'not_controversial')
+                }
+            },
+            
+            # YouTube rate limiting stats
+            "youtube_stats": {
+                "total_transcript_requests": youtube_rate_limiter['total_transcript_requests'],
+                "total_api_calls": youtube_rate_limiter['total_api_calls'],
+                "currently_blocked": youtube_rate_limiter['blocked_until'] is not None and youtube_rate_limiter['blocked_until'] > time.time(),
+                "blocked_until": youtube_rate_limiter['blocked_until'] if youtube_rate_limiter['blocked_until'] and youtube_rate_limiter['blocked_until'] > time.time() else None,
+                "consecutive_blocks": youtube_rate_limiter['consecutive_blocks'],
+                "last_block_time": youtube_rate_limiter['last_block_time']
+            },
+            
+            # ETA and performance information
+            "eta": eta_info,
+            
+            # Queue information (if applicable)
+            "queue_info": {}
         }
-    
-    # DEBUG: Log what we're sending to frontend
-    logger.info(f"   📤 Sending to frontend - Channel Progress: {channel_progress_percentage:.1f}%, Video Progress: {video_progress_percentage:.1f}%")
-    logger.info(f"   📤 Pipeline stages being sent: {response['pipeline_stages']}")
-    
-    return response
+        
+        # Add queue information for queued jobs
+        if job['status'] == 'queued':
+            response["queue_info"] = {
+                "queue_position": job.get('queue_position', 0),
+                "estimated_wait_minutes": job.get('estimated_wait_minutes', 0),
+                "estimated_start_time": job.get('estimated_start_time'),
+                "message": f"Your job is queued at position {job.get('queue_position', 0)}. Estimated wait time: {job.get('estimated_wait_minutes', 0)} minutes."
+            }
+        
+        # DEBUG: Log what we're sending to frontend
+        logger.info(f"   📤 Sending to frontend - Channel Progress: {channel_progress_percentage:.1f}%, Video Progress: {video_progress_percentage:.1f}%")
+        logger.info(f"   📤 Pipeline stages being sent: {response['pipeline_stages']}")
+        
+        return response
+        
+    except Exception as e:
+        logger.error(f"Error getting job status: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/bulk-analyze/{job_id}/results")
 async def get_bulk_analysis_results(job_id: str):

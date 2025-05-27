@@ -6,10 +6,11 @@ from typing import Tuple
 
 logger = logging.getLogger(__name__)
 
-async def screen_creator_for_controversy(channel_name: str, channel_handle: str, llm_analyzer) -> Tuple[bool, str]:
+async def screen_creator_for_controversy(channel_name: str, channel_handle: str, llm_analyzer) -> Tuple[bool, str, str]:
     """
     Pre-screen a creator for ongoing controversies using LLM.
-    Returns (is_controversial, reason)
+    Returns (is_controversial, reason, status)
+    where status is one of: 'controversial', 'not_controversial', 'error'
     """
     try:
         logger.info(f"🔍 CONTROVERSY CHECK: Screening creator - Name: '{channel_name}', Handle: '{channel_handle}'")
@@ -65,7 +66,7 @@ async def screen_creator_for_controversy(channel_name: str, channel_handle: str,
             confidence = response.get('confidence', 'low')
             if confidence == 'low':
                 logger.info(f"🔍 CONTROVERSY CHECK: Low confidence for {channel_name}, not flagging")
-                return False, "Low confidence in controversy assessment"
+                return False, "Low confidence in controversy assessment", "not_controversial"
             
             is_controversial = response.get('is_controversial', False)
             reason = response.get('reason', 'Unknown')
@@ -73,16 +74,16 @@ async def screen_creator_for_controversy(channel_name: str, channel_handle: str,
             # Log the decision for debugging
             if is_controversial:
                 logger.info(f"🚫 Controversy check: {channel_name} flagged with {confidence} confidence - {reason}")
+                return True, reason, "controversial"
             else:
                 logger.info(f"✅ Controversy check: {channel_name} passed screening with {confidence} confidence")
-            
-            return is_controversial, reason
+                return False, reason, "not_controversial"
         
         # Default to not controversial if check fails
         logger.warning(f"Controversy check returned invalid response for {channel_name}, defaulting to not controversial")
-        return False, "Controversy check returned invalid response"
+        return False, "Controversy check returned invalid response", "error"
         
     except Exception as e:
         logger.error(f"Failed to screen creator {channel_name} for controversies: {str(e)}", exc_info=True)
         # On error, log but don't block the creator
-        return False, f"Controversy screening check failed: {str(e)}" 
+        return False, f"Controversy screening check failed: {str(e)}", "error" 

@@ -5,7 +5,8 @@ import asyncio
 import logging
 import time
 from typing import Dict, Any
-from datetime import datetime
+from datetime import datetime, timedelta
+import traceback
 
 from src.youtube_analyzer import YouTubeAnalyzer
 from src.llm_analyzer import LLMAnalyzer
@@ -13,6 +14,83 @@ from src.rate_limiter import youtube_rate_limiter
 from src.controversy_screener import screen_creator_for_controversy
 
 logger = logging.getLogger(__name__)
+
+def calculate_job_eta(job: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Calculate ETA information for a job based on current progress.
+    This is the single source of truth for ETA calculations.
+    
+    Args:
+        job: Dictionary containing job information including status, progress, and timing data
+        
+    Returns:
+        Dictionary containing ETA information including:
+        - estimated_completion_time: ISO format timestamp
+        - estimated_minutes_remaining: Integer minutes
+        - processing_rate_per_minute: Float rate
+        - elapsed_minutes: Float minutes
+        - progress_type: Either "videos" or "channels"
+    """
+    eta_info = {}
+    
+    if job['status'] == 'processing':
+        elapsed_time = time.time() - job['performance_stats']['overall_start_time']
+        
+        # Calculate processing rate using video completion
+        video_progress = job.get('video_progress', {})
+        videos_completed = video_progress.get('videos_completed', 0)
+        total_videos = video_progress.get('total_videos_discovered', 0)
+        
+        if videos_completed > 0:
+            # Calculate processing rate using video completion
+            processing_rate_per_second = videos_completed / elapsed_time
+            processing_rate_per_minute = processing_rate_per_second * 60
+            
+            # Estimate remaining time
+            remaining_videos = total_videos - videos_completed
+            estimated_seconds_remaining = remaining_videos / processing_rate_per_second if processing_rate_per_second > 0 else 0
+            estimated_minutes_remaining = estimated_seconds_remaining / 60
+            
+            eta_info = {
+                "estimated_completion_time": (
+                    datetime.now() + timedelta(seconds=estimated_seconds_remaining)
+                ).isoformat(),
+                "estimated_minutes_remaining": max(1, int(estimated_minutes_remaining)),
+                "processing_rate_per_minute": round(processing_rate_per_minute, 2),
+                "elapsed_minutes": round(elapsed_time / 60, 1),
+                "progress_type": "videos"
+            }
+        else:
+            # Fallback to channel-level progress if no videos completed yet
+            total_processed = len(job['results']) + len(job['failed_urls'])
+            if total_processed > 0:
+                processing_rate_per_second = total_processed / elapsed_time
+                processing_rate_per_minute = processing_rate_per_second * 60
+                
+                # Estimate remaining time
+                remaining_urls = job['total_urls'] - total_processed
+                estimated_seconds_remaining = remaining_urls / processing_rate_per_second if processing_rate_per_second > 0 else 0
+                estimated_minutes_remaining = estimated_seconds_remaining / 60
+                
+                eta_info = {
+                    "estimated_completion_time": (
+                        datetime.now() + timedelta(seconds=estimated_seconds_remaining)
+                    ).isoformat(),
+                    "estimated_minutes_remaining": max(1, int(estimated_minutes_remaining)),
+                    "processing_rate_per_minute": round(processing_rate_per_minute, 2),
+                    "elapsed_minutes": round(elapsed_time / 60, 1),
+                    "progress_type": "channels"
+                }
+            else:
+                eta_info = {
+                    "estimated_completion_time": None,
+                    "estimated_minutes_remaining": None,
+                    "processing_rate_per_minute": 0,
+                    "elapsed_minutes": round(elapsed_time / 60, 1),
+                    "progress_type": "channels"
+                }
+    
+    return eta_info
 
 def update_pipeline_stage(job_id: str, from_stage: str, to_stage: str, count: int = 1, analysis_results: dict = None):
     """Helper function to update pipeline stage counters"""
@@ -161,7 +239,7 @@ async def controversy_screening_worker(worker_id: int, controversy_queue: asynci
             logger.debug(f"⚠️ Controversy Worker {worker_id}: Screening {channel_name} for controversies")
             
             # Screen for controversies
-            is_controversial, controversy_reason = await screen_creator_for_controversy(
+            is_controversial, controversy_reason, controversy_status = await screen_creator_for_controversy(
                 channel_name or "Unknown", 
                 channel_handle or "Unknown",
                 llm_analyzer
@@ -170,21 +248,24 @@ async def controversy_screening_worker(worker_id: int, controversy_queue: asynci
             screening_time = time.time() - start_time
             timing_stats['controversy_screening'].append(screening_time)
             
-            if is_controversial:
+            # Initialize controversy check failures if not exists
+            if 'controversy_check_failures' not in analysis_results[job_id]:
+                analysis_results[job_id]['controversy_check_failures'] = {}
+            
+            # Add to controversy check failures with status
+            if url not in analysis_results[job_id]['controversy_check_failures']:
+                analysis_results[job_id]['controversy_check_failures'][url] = {
+                    'channel_name': channel_name,
+                    'reason': controversy_reason,
+                    'status': controversy_status,
+                    'timestamp': datetime.now().isoformat()
+                }
+            
+            if controversy_status == 'controversial':
                 logger.warning(f"🚫 Controversy Worker {worker_id}: Creator {channel_name} flagged for controversy: {controversy_reason}")
                 
                 # Update pipeline stage: screening -> controversy check failed
                 update_pipeline_stage(job_id, 'screening_controversy', 'controversy_check_failed', analysis_results=analysis_results)
-                
-                # Add to controversy check failures
-                if url not in analysis_results[job_id].get('controversy_check_failures', {}):
-                    if 'controversy_check_failures' not in analysis_results[job_id]:
-                        analysis_results[job_id]['controversy_check_failures'] = {}
-                    analysis_results[job_id]['controversy_check_failures'][url] = {
-                        'channel_name': channel_name,
-                        'reason': controversy_reason,
-                        'timestamp': datetime.now().isoformat()
-                    }
                 
                 # Still queue the videos for processing despite controversy
                 for video in videos:
@@ -203,7 +284,8 @@ async def controversy_screening_worker(worker_id: int, controversy_queue: asynci
                         'channel_name': channel_name,
                         'channel_handle': channel_handle,
                         'start_time': time.time(),
-                        'controversy_check_failed': True  # Flag that controversy check failed
+                        'controversy_check_failed': True,  # Flag that controversy check failed
+                        'controversy_status': controversy_status
                     })
             else:
                 logger.debug(f"✅ Controversy Worker {worker_id}: {channel_name} passed controversy screening in {screening_time:.2f}s")
@@ -224,7 +306,9 @@ async def controversy_screening_worker(worker_id: int, controversy_queue: asynci
                         'channel_id': channel_id,
                         'channel_name': channel_name,
                         'channel_handle': channel_handle,
-                        'start_time': time.time()
+                        'start_time': time.time(),
+                        'controversy_check_failed': controversy_status == 'error',  # Only flag as failed if there was an error
+                        'controversy_status': controversy_status
                     })
             
             # Mark task as done
@@ -251,6 +335,7 @@ async def controversy_screening_worker(worker_id: int, controversy_queue: asynci
                 analysis_results[job_id]['controversy_check_failures'][url] = {
                     'channel_name': channel_name,
                     'error': str(e),
+                    'status': 'error',
                     'timestamp': datetime.now().isoformat()
                 }
             
@@ -272,7 +357,8 @@ async def controversy_screening_worker(worker_id: int, controversy_queue: asynci
                         'channel_name': channel_name,
                         'channel_handle': item.get('channel_handle', 'Unknown'),
                         'start_time': time.time(),
-                        'controversy_check_failed': True  # Flag that controversy check failed
+                        'controversy_check_failed': True,  # Flag that controversy check failed
+                        'controversy_status': 'error'
                     })
             
             controversy_queue.task_done()
@@ -490,18 +576,21 @@ async def result_worker(worker_id: int, result_queue: asyncio.Queue, timing_stat
         try:
             # Check if job is cancelled
             if is_job_cancelled(job_id, analysis_results):
-                logger.info(f"📝 Result Worker {worker_id}: Job {job_id} cancelled, stopping...")
+                logger.info(f"📊 Result Worker {worker_id}: Job {job_id} cancelled, stopping...")
                 break
-                
+            
             # Get work item
             item = await result_queue.get()
             url = item['url']  # Original channel URL
-            start_time = time.time()
-            
-            # Update pipeline stage: queued for results -> result processing
-            update_pipeline_stage(job_id, 'queued_for_results', 'result_processing', analysis_results=analysis_results)
-            
-            logger.debug(f"📝 Result Worker {worker_id}: Processing video result for {url}")
+            video_id = item['video_id']
+            video_title = item['video_title']
+            video_url = item['video_url']
+            video_analysis = item['video_analysis']
+            transcript = item['transcript']
+            channel_id = item['channel_id']
+            channel_name = item['channel_name']
+            channel_handle = item['channel_handle']
+            controversy_status = item.get('controversy_status', 'not_controversial')
             
             # Get or create channel entry
             if url not in analysis_results[job_id]['results']:
@@ -531,7 +620,8 @@ async def result_worker(worker_id: int, result_queue: asyncio.Queue, timing_stat
                     "video_analyses": [],
                     "summary": {},
                     "original_videos": [],
-                    "controversy_flagged": controversy_info is not None,
+                    "controversy_flagged": controversy_status == 'controversial',
+                    "controversy_status": controversy_status,
                     "controversy_reason": controversy_info.get('reason') if controversy_info else None
                 }
             
@@ -540,122 +630,159 @@ async def result_worker(worker_id: int, result_queue: asyncio.Queue, timing_stat
                 "video_id": item['video_id'],
                 "video_title": item['video_title'],
                 "video_url": item['video_url'],
-                "analysis": item['video_analysis']
+                "analysis": item['video_analysis'],
+                "controversy_status": controversy_status
             }
             
-            video_data_entry = {
-                "id": item['video_id'],
-                "title": item['video_title'],
-                "url": item['video_url'],
-                "transcript": item['transcript']
-            }
-            
-            analysis_results[job_id]['results'][url]["video_analyses"].append(video_analysis_entry)
-            analysis_results[job_id]['results'][url]["original_videos"].append(video_data_entry)
+            analysis_results[job_id]['results'][url]['video_analyses'].append(video_analysis_entry)
             
             # Update video progress tracking
             analysis_results[job_id]['video_progress']['videos_completed'] += 1
             
-            # Update progress tracking (count when we complete a video, not when we finish a channel)
-            # Note: This will over-count, but we'll fix in final aggregation
+            # Update pipeline stage: queued for results -> result processing
+            update_pipeline_stage(job_id, 'queued_for_results', 'result_processing', analysis_results=analysis_results)
             
-            # Update pipeline stage: result processing -> completed
-            update_pipeline_stage(job_id, 'result_processing', 'completed', analysis_results=analysis_results)
-            
-            result_time = time.time() - start_time
-            logger.debug(f"✅ Result Worker {worker_id}: Added video {item['video_id']} to channel {url} in {result_time:.3f}s")
-            
+            # Mark task as done
             result_queue.task_done()
             
         except asyncio.CancelledError:
             break
         except Exception as e:
-            logger.error(f"💥 Result worker {worker_id} error: {e}")
+            url = item.get('url', 'unknown') if 'item' in locals() else 'unknown'
+            video_id = item.get('video_id', 'unknown')
+            channel_name = item.get('channel_name', 'Unknown')
+            error_msg = f"Failed to process results for video {video_id} from channel {channel_name}: {str(e)}"
             
-            # Update pipeline stage: result processing -> failed (if we can determine the URL)
-            if 'item' in locals() and 'url' in item:
-                update_pipeline_stage(job_id, 'result_processing', 'failed', analysis_results=analysis_results)
+            logger.error(f"💥 Result worker {worker_id} error processing video {video_id}: {e}")
+            
+            # Update pipeline stage: result processing -> failed
+            update_pipeline_stage(job_id, 'result_processing', 'failed', analysis_results=analysis_results)
+            
+            # Add to failed URLs with clear messaging
+            analysis_results[job_id]['failed_urls'].append({
+                'url': url,
+                'error': error_msg,
+                'error_type': 'result_processing_failed',
+                'channel_name': channel_name,
+                'video_id': video_id
+            })
             
             result_queue.task_done()
 
-async def monitor_pipeline_detailed(job_id: str, channel_queue: asyncio.Queue, controversy_queue: asyncio.Queue, video_queue: asyncio.Queue, 
-                                   llm_queue: asyncio.Queue, result_queue: asyncio.Queue, total_urls: int, timing_stats: dict, analysis_results: dict):
-    """Monitor queue depths and progress with enhanced tracking"""
-    monitor_start = time.time()
-    monitoring_interval = 3  # Monitor every 3 seconds for better granularity
-    last_detailed_log = 0
-    
-    logger.info(f"🔍 Starting enhanced pipeline monitoring for job {job_id}")
-    
-    while True:
-        try:
-            await asyncio.sleep(monitoring_interval)
+async def monitor_pipeline_detailed(job_id: str, channel_queue: asyncio.Queue = None, controversy_queue: asyncio.Queue = None, 
+                                   video_queue: asyncio.Queue = None, llm_queue: asyncio.Queue = None, 
+                                   result_queue: asyncio.Queue = None, total_urls: int = None, 
+                                   timing_stats: dict = None, analysis_results: dict = None):
+    """
+    Monitor pipeline progress and update job status with detailed metrics.
+    Can be used in two modes:
+    1. Full monitoring mode: When all parameters are provided, monitors queue depths and progress
+    2. Status update mode: When only job_id is provided, just updates the job's ETA and progress stats
+    """
+    try:
+        job = analysis_results.get(job_id)
+        if not job:
+            logger.error(f"Job {job_id} not found in analysis_results")
+            return
+
+        # Calculate ETA using shared function
+        eta_info = calculate_job_eta(job)
+        
+        # Update job with ETA info
+        job['performance_stats']['eta_info'] = eta_info
+        
+        # Update processing rate in performance stats
+        if eta_info.get('processing_rate_per_minute'):
+            job['performance_stats']['processing_rate_per_minute'] = eta_info['processing_rate_per_minute']
+        
+        # Log progress
+        logger.info(f"📊 Job {job_id} progress update:")
+        logger.info(f"   📈 Channel progress: {len(job['results'])}/{job['total_urls']} channels processed")
+        logger.info(f"   📊 Video progress: {job.get('video_progress', {}).get('videos_completed', 0)}/{job.get('video_progress', {}).get('total_videos_discovered', 0)} videos completed")
+        logger.info(f"   ⏱️ ETA: {eta_info.get('estimated_minutes_remaining', 'N/A')} minutes remaining")
+
+        # If we're in full monitoring mode (all parameters provided)
+        if all([channel_queue, controversy_queue, video_queue, llm_queue, result_queue, total_urls, timing_stats]):
+            monitor_start = time.time()
+            monitoring_interval = 3  # Monitor every 3 seconds for better granularity
+            last_detailed_log = 0
             
-            current_time = time.time()
-            elapsed = current_time - monitor_start
+            logger.info(f"🔍 Starting enhanced pipeline monitoring for job {job_id}")
             
-            channel_size = channel_queue.qsize()
-            controversy_size = controversy_queue.qsize()
-            video_size = video_queue.qsize() 
-            llm_size = llm_queue.qsize() 
-            result_size = result_queue.qsize()
-            
-            completed = len(analysis_results[job_id]['results'])
-            failed = len(analysis_results[job_id]['failed_urls'])
-            processed = completed + failed
-            
-            # Always log basic status
-            progress_pct = (processed/total_urls*100) if total_urls > 0 else 0
-            logger.info(f"📊 D:{channel_size:2d} | C:{controversy_size:2d} | T:{video_size:2d} | L:{llm_size:2d} | R:{result_size:2d} | {processed:3d}/{total_urls} ({progress_pct:5.1f}%) | {elapsed:6.1f}s elapsed")
-            
-            # Update queue depths for analysis
-            if 'queue_depths' not in timing_stats:
-                timing_stats['queue_depths'] = {
-                    'channel': [],
-                    'controversy': [],
-                    'video': [],
-                    'llm': [],
-                    'result': []
-                }
-                timing_stats['timestamps'] = []
-            
-            timing_stats['queue_depths']['channel'].append(channel_size)
-            timing_stats['queue_depths']['controversy'].append(controversy_size)
-            timing_stats['queue_depths']['video'].append(video_size)
-            timing_stats['queue_depths']['llm'].append(llm_size)
-            timing_stats['queue_depths']['result'].append(result_size)
-            timing_stats['timestamps'].append(current_time)
-            
-            # Detailed logging every 15 seconds
-            if elapsed - last_detailed_log >= 15:
-                last_detailed_log = elapsed
-                
-                if processed > 0:
-                    rate = processed / elapsed
-                    eta_seconds = (total_urls - processed) / rate if rate > 0 else 0
-                    eta_minutes = eta_seconds / 60
+            while True:
+                try:
+                    await asyncio.sleep(monitoring_interval)
                     
-                    # Debug current max values
-                    current_max_c = max(timing_stats['queue_depths']['channel'], default=0)
-                    current_max_cont = max(timing_stats['queue_depths']['controversy'], default=0)
-                    current_max_v = max(timing_stats['queue_depths']['video'], default=0)
-                    current_max_l = max(timing_stats['queue_depths']['llm'], default=0)
-                    current_max_r = max(timing_stats['queue_depths']['result'], default=0)
+                    current_time = time.time()
+                    elapsed = current_time - monitor_start
                     
-                    logger.info(f"📈 DETAILED STATUS:")
-                    logger.info(f"   └─ Processing rate: {rate:.2f} URLs/sec")
-                    logger.info(f"   └─ ETA: {eta_minutes:.1f} minutes ({eta_seconds:.0f}s)")
-                    logger.info(f"   └─ Queue depths - Max seen: D:{current_max_c} | C:{current_max_cont} | T:{current_max_v} | L:{current_max_l} | R:{current_max_r}")
-                    logger.info(f"   └─ Pipeline stages: {analysis_results[job_id]['pipeline_stages']}")
-            
-            # If all work is done, break
-            if processed >= total_urls and channel_size == 0 and controversy_size == 0 and video_size == 0 and llm_size == 0 and result_size == 0:
-                logger.info("🏁 All work completed, stopping monitor")
-                logger.info(f"📊 Final monitoring stats: {len(timing_stats['queue_depths']['channel'])} data points collected over {elapsed:.1f}s")
-                break
-                
-        except asyncio.CancelledError:
-            logger.info("🔍 Pipeline monitor cancelled")
-            break
-        except Exception as e:
-            logger.error(f"💥 Monitor error: {e}") 
+                    channel_size = channel_queue.qsize()
+                    controversy_size = controversy_queue.qsize()
+                    video_size = video_queue.qsize() 
+                    llm_size = llm_queue.qsize() 
+                    result_size = result_queue.qsize()
+                    
+                    completed = len(analysis_results[job_id]['results'])
+                    failed = len(analysis_results[job_id]['failed_urls'])
+                    processed = completed + failed
+                    
+                    # Always log basic status
+                    progress_pct = (processed/total_urls*100) if total_urls > 0 else 0
+                    logger.info(f"📊 D:{channel_size:2d} | C:{controversy_size:2d} | T:{video_size:2d} | L:{llm_size:2d} | R:{result_size:2d} | {processed:3d}/{total_urls} ({progress_pct:5.1f}%) | {elapsed:6.1f}s elapsed")
+                    
+                    # Update queue depths for analysis
+                    if 'queue_depths' not in timing_stats:
+                        timing_stats['queue_depths'] = {
+                            'channel': [],
+                            'controversy': [],
+                            'video': [],
+                            'llm': [],
+                            'result': []
+                        }
+                        timing_stats['timestamps'] = []
+                    
+                    timing_stats['queue_depths']['channel'].append(channel_size)
+                    timing_stats['queue_depths']['controversy'].append(controversy_size)
+                    timing_stats['queue_depths']['video'].append(video_size)
+                    timing_stats['queue_depths']['llm'].append(llm_size)
+                    timing_stats['queue_depths']['result'].append(result_size)
+                    timing_stats['timestamps'].append(current_time)
+                    
+                    # Detailed logging every 15 seconds
+                    if elapsed - last_detailed_log >= 15:
+                        last_detailed_log = elapsed
+                        
+                        if processed > 0:
+                            rate = processed / elapsed
+                            eta_info = calculate_job_eta(analysis_results[job_id])
+                            
+                            # Debug current max values
+                            current_max_c = max(timing_stats['queue_depths']['channel'], default=0)
+                            current_max_cont = max(timing_stats['queue_depths']['controversy'], default=0)
+                            current_max_v = max(timing_stats['queue_depths']['video'], default=0)
+                            current_max_l = max(timing_stats['queue_depths']['llm'], default=0)
+                            current_max_r = max(timing_stats['queue_depths']['result'], default=0)
+                            
+                            logger.info(f"📈 DETAILED STATUS:")
+                            logger.info(f"   └─ Processing rate: {rate:.2f} URLs/sec")
+                            logger.info(f"   └─ ETA: {eta_info.get('estimated_minutes_remaining', 'N/A')} minutes")
+                            logger.info(f"   └─ Queue depths - Max seen: D:{current_max_c} | C:{current_max_cont} | T:{current_max_v} | L:{current_max_l} | R:{current_max_r}")
+                            logger.info(f"   └─ Pipeline stages: {analysis_results[job_id]['pipeline_stages']}")
+                    
+                    # If all work is done, break
+                    if processed >= total_urls and channel_size == 0 and controversy_size == 0 and video_size == 0 and llm_size == 0 and result_size == 0:
+                        logger.info("🏁 All work completed, stopping monitor")
+                        logger.info(f"📊 Final monitoring stats: {len(timing_stats['queue_depths']['channel'])} data points collected over {elapsed:.1f}s")
+                        break
+                        
+                except asyncio.CancelledError:
+                    logger.info("🔍 Pipeline monitor cancelled")
+                    break
+                except Exception as e:
+                    logger.error(f"💥 Monitor error: {e}")
+                    logger.error(traceback.format_exc())
+                    break
+        
+    except Exception as e:
+        logger.error(f"Error in monitor_pipeline_detailed: {str(e)}")
+        logger.error(traceback.format_exc()) 
