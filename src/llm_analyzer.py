@@ -638,4 +638,82 @@ INSTRUCTIONS:
                 "video_id": video_data.get('id', 'unknown'),
                 "error": str(e),
                 "results": {}
-            } 
+            }
+
+    async def check_controversy_async(self, prompt: str) -> Dict[str, Any]:
+        """
+        Check for controversies using LLM (asynchronous version)
+        
+        Args:
+            prompt: The prompt to send to the LLM
+            
+        Returns:
+            Dictionary with controversy check results
+        """
+        try:
+            if self.provider == "local":
+                # For local LLM, use synchronous method
+                return self._query_local_llm_simple(prompt)
+            else:
+                # For OpenAI, use async method
+                return await self._query_openai_simple_async(prompt)
+        except Exception as e:
+            logger.error(f"Error checking controversy: {str(e)}")
+            return {"is_controversial": False, "reason": "Check failed"}
+    
+    def _query_local_llm_simple(self, prompt: str) -> Dict[str, Any]:
+        """Query local LLM for simple JSON responses"""
+        url = f"{self.api_base_url}/chat/completions"
+        
+        payload = {
+            "model": "local-model",
+            "messages": [
+                {"role": "user", "content": prompt}
+            ],
+            "temperature": 0.1
+        }
+        
+        try:
+            response = requests.post(url, json=payload)
+            response.raise_for_status()
+            
+            result = response.json()
+            content = result.get("choices", [{}])[0].get("message", {}).get("content", "{}")
+            
+            # Extract JSON from response
+            return self._extract_valid_json(content)
+        except Exception as e:
+            logger.error(f"Error querying local LLM: {str(e)}")
+            return {"is_controversial": False, "reason": "Check failed"}
+    
+    async def _query_openai_simple_async(self, prompt: str) -> Dict[str, Any]:
+        """Query OpenAI for simple JSON responses"""
+        url = f"{self.api_base_url}/chat/completions"
+        
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
+        }
+        
+        payload = {
+            "model": self.openai_model,
+            "messages": [
+                {"role": "user", "content": prompt}
+            ],
+            "temperature": 0.1,
+            "max_tokens": 200  # Small response expected
+        }
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, headers=headers, json=payload) as response:
+                    response.raise_for_status()
+                    
+                    result = await response.json()
+                    content = result.get("choices", [{}])[0].get("message", {}).get("content", "{}")
+                    
+                    # Extract JSON from response
+                    return self._extract_valid_json(content)
+        except Exception as e:
+            logger.error(f"Error querying OpenAI: {str(e)}")
+            return {"is_controversial": False, "reason": "Check failed"} 
