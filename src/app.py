@@ -24,6 +24,7 @@ import random
 
 from src.youtube_analyzer import YouTubeAnalyzer
 from src.llm_analyzer import LLMAnalyzer
+from src.version import __version__, __build_date__, VERSION_HISTORY
 
 # Configure logging
 logging.basicConfig(
@@ -103,7 +104,7 @@ logger.info(f"Default LLM provider from environment: {default_llm_provider}")
 app = FastAPI(
     title="YouTube Content Compliance Analyzer",
     description="API for analyzing YouTube content against compliance categories",
-    version="1.0.0"
+    version=__version__
 )
 
 # Add CORS middleware
@@ -188,9 +189,21 @@ def is_job_cancelled(job_id: str) -> bool:
 
 @app.get("/")
 async def root():
-    return {"message": "YouTube Content Compliance Analyzer API"}
+    return {
+        "message": "YouTube Content Compliance Analyzer API",
+        "version": __version__,
+        "api_docs": "/docs"
+    }
 
-
+@app.get("/api/version")
+async def get_version():
+    """Get API version information"""
+    return {
+        "version": __version__,
+        "api_name": "YouTube Content Compliance Analyzer",
+        "build_date": __build_date__,
+        "version_history": VERSION_HISTORY
+    }
 
 @app.post("/api/analyze-creator", response_model=AnalysisResponse)
 async def analyze_creator(request: CreatorAnalysisRequest):
@@ -532,6 +545,28 @@ async def process_bulk_analysis(urls: List[str], video_limit: int, llm_provider:
         total_processed = len(analysis_results[job_id]['results']) + len(analysis_results[job_id]['failed_urls'])
         if total_processed != len(urls):
             logger.warning(f"Job {job_id}: Processed {total_processed} URLs but expected {len(urls)}")
+            
+            # Try to identify missing URLs
+            processed_urls = set()
+            for url in analysis_results[job_id]['results']:
+                processed_urls.add(url)
+            for failed in analysis_results[job_id]['failed_urls']:
+                processed_urls.add(failed['url'])
+                
+            missing_urls = []
+            for url in urls:
+                if url not in processed_urls:
+                    missing_urls.append(url)
+                    
+            if missing_urls:
+                logger.error(f"Job {job_id}: Missing URLs: {missing_urls}")
+                # Add missing URLs as failures
+                for missing_url in missing_urls:
+                    analysis_results[job_id]['failed_urls'].append({
+                        'url': missing_url,
+                        'error': 'URL was not processed due to a system error',
+                        'error_type': 'system_error'
+                    })
         
         # Mark job as complete
         analysis_results[job_id]['status'] = 'completed'
@@ -869,6 +904,7 @@ async def get_bulk_analysis_status(job_id: str):
         "completed_at": job.get('completed_at'),
         "total_urls": job['total_urls'],
         "processed_urls": job['processed_urls'],
+        "api_version": __version__,  # Add version info
         
         # Basic progress info (for backward compatibility)
         "progress": {
@@ -1669,6 +1705,8 @@ async def channel_discovery_worker(worker_id: int, channel_queue: asyncio.Queue,
                     'error': error_msg,
                     'error_type': 'invalid_channel'
                 })
+                # CRITICAL: Mark task as done!
+                channel_queue.task_done()
             else:
                 # Pre-screen for controversies
                 llm_analyzer = LLMAnalyzer(provider=os.getenv("LLM_PROVIDER", "local"))
@@ -1693,6 +1731,8 @@ async def channel_discovery_worker(worker_id: int, channel_queue: asyncio.Queue,
                         'channel_id': channel_id,
                         'controversy_score': 1.0  # Maximum controversy score
                     })
+                    # CRITICAL: Mark task as done!
+                    channel_queue.task_done()
                 else:
                     # Get video list from channel
                     videos = youtube_analyzer.get_videos_from_channel(channel_id, limit=video_limit)
@@ -1710,6 +1750,8 @@ async def channel_discovery_worker(worker_id: int, channel_queue: asyncio.Queue,
                             'error_type': 'no_videos',
                             'channel_name': channel_name or 'Unknown'
                         })
+                        # CRITICAL: Mark task as done!
+                        channel_queue.task_done()
                     else:
                         discovery_time = time.time() - start_time
                         timing_stats['channel_discovery_times'].append(discovery_time)
@@ -1734,7 +1776,7 @@ async def channel_discovery_worker(worker_id: int, channel_queue: asyncio.Queue,
                                 'channel_handle': channel_handle,
                                 'start_time': time.time()
                             })
-            
+                        # Mark task as done after all videos are queued
             channel_queue.task_done()
             
         except asyncio.CancelledError:
@@ -1780,6 +1822,11 @@ async def video_transcript_worker(worker_id: int, video_queue: asyncio.Queue, ll
             # Get work item
             item = await video_queue.get()
             video_id = item['video_id']
+            
+            # Track retry attempts
+            retry_count = item.get('retry_count', 0)
+            max_retries = 3
+            
             start_time = time.time()
             
             # Update pipeline stage: queued for transcripts -> fetching transcripts
@@ -1815,11 +1862,22 @@ async def video_transcript_worker(worker_id: int, video_queue: asyncio.Queue, ll
                         
                         logger.warning(f"🛑 YouTube rate limit hit! Backing off for {backoff}s (attempt #{youtube_rate_limiter['consecutive_blocks']})")
                     
-                    # Put the item back in the queue for retry
-                    await video_queue.put(item)
+                    # Check if we've exceeded max retries
+                    if retry_count >= max_retries:
+                        logger.error(f"❌ Video Worker {worker_id}: Max retries exceeded for video {video_id}")
+                        # Update pipeline stage: fetching transcripts -> failed
+                        update_pipeline_stage(job_id, 'fetching_transcripts', 'failed')
+                        # Don't add to failed_urls since this is a video-level failure
+                    else:
+                        # Put the item back in the queue for retry with incremented count
+                        item['retry_count'] = retry_count + 1
+                        await video_queue.put(item)
+                        
+                        # Update pipeline stage back
+                        update_pipeline_stage(job_id, 'fetching_transcripts', 'queued_for_transcripts')
                     
-                    # Update pipeline stage back
-                    update_pipeline_stage(job_id, 'fetching_transcripts', 'queued_for_transcripts')
+                    # CRITICAL: Mark the current task as done before retrying
+                    video_queue.task_done()
                 else:
                     # Success! Reset consecutive blocks
                     async with youtube_rate_limiter['lock']:
