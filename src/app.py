@@ -2,8 +2,8 @@
 FastAPI application for YouTube content compliance analysis
 
 Environment Variables for YouTube Rate Limiting (to prevent IP blocking):
-- YOUTUBE_MAX_CONCURRENT: Maximum concurrent transcript requests (default: 5)
-- YOUTUBE_REQUEST_DELAY: Delay between transcript requests in seconds (default: 0.5)
+- YOUTUBE_MAX_CONCURRENT: Maximum concurrent transcript requests (default: 2)
+- YOUTUBE_REQUEST_DELAY: Delay between transcript requests in seconds (default: 3.0)
 """
 import os
 from dotenv import load_dotenv
@@ -28,7 +28,7 @@ from src.rate_limiter import youtube_rate_limiter
 from src.controversy_screener import screen_creator_for_controversy
 from src.job_manager import (
     job_queue, current_job_id, job_queue_lock, active_job_tasks,
-    process_job_with_cleanup
+    process_job_with_cleanup, update_queue_wait_times
 )
 from src.export_handlers import (
     download_bulk_analysis_csv,
@@ -162,6 +162,7 @@ async def monitor_abandoned_jobs():
                 time_since_last_check = (current_time - last_check).total_seconds()
                 if time_since_last_check > ABANDONED_JOB_TIMEOUT:
                     logger.warning(f"🕒 Job {job_id} appears abandoned (no status checks for {time_since_last_check:.1f}s)")
+                    logger.warning(f"🕒 Job status: {job['status']}, last check: {last_check}")
                     
                     # Cancel the job
                     try:
@@ -169,6 +170,10 @@ async def monitor_abandoned_jobs():
                         logger.info(f"✅ Automatically cancelled abandoned job {job_id}")
                     except Exception as e:
                         logger.error(f"❌ Failed to auto-cancel abandoned job {job_id}: {str(e)}")
+                else:
+                    # Debug: Log active jobs periodically
+                    if time_since_last_check > 10:  # Only log if it's been more than 10 seconds
+                        logger.debug(f"🔄 Active job {job_id}: {job['status']}, last check {time_since_last_check:.1f}s ago")
             
             # Sleep for a bit before next check
             await asyncio.sleep(5)  # Check every 5 seconds
@@ -520,6 +525,9 @@ async def bulk_analyze(
         
         # Add queue information if job is queued
         if analysis_results[job_id]['status'] == 'queued':
+            # Update queue wait times dynamically
+            await update_queue_wait_times(analysis_results)
+            
             response.update({
                 "queue_position": analysis_results[job_id]['queue_position'],
                 "estimated_wait_minutes": analysis_results[job_id]['estimated_wait_minutes'],
@@ -537,9 +545,15 @@ async def bulk_analyze(
 async def get_bulk_analysis_status(job_id: str):
     """Get detailed status of a bulk analysis job with pipeline breakdown and ETA"""
     try:
+        # Debug: Log the job lookup attempt
+        logger.debug(f"🔍 Looking up job {job_id}")
+        logger.debug(f"🔍 Available jobs: {list(analysis_results.keys())}")
+        
         # Get job data
         job = analysis_results.get(job_id)
         if not job:
+            logger.error(f"❌ Job {job_id} not found in analysis_results")
+            logger.error(f"❌ Available job IDs: {list(analysis_results.keys())}")
             raise HTTPException(status_code=404, detail="Job not found")
         
         # Update last status check timestamp
@@ -656,6 +670,9 @@ async def get_bulk_analysis_status(job_id: str):
         
         # Add queue position info for queued jobs
         if job['status'] == 'queued':
+            # Update queue wait times dynamically
+            await update_queue_wait_times(analysis_results)
+            
             response["queue_info"].update({
                 "queue_position": job.get('queue_position', 0),
                 "estimated_wait_minutes": job.get('estimated_wait_minutes', 0),
@@ -664,9 +681,9 @@ async def get_bulk_analysis_status(job_id: str):
             })
         
         # DEBUG: Log what we're sending to frontend
-        logger.info(f"   📤 Sending to frontend - Channel Progress: {channel_progress_percentage:.1f}%, Video Progress: {video_progress_percentage:.1f}%")
-        logger.info(f"   📤 Pipeline stages being sent: {response['pipeline_stages']}")
-        logger.info(f"   📤 Queue sizes: {queue_sizes}")
+        # logger.info(f"   📤 Sending to frontend - Channel Progress: {channel_progress_percentage:.1f}%, Video Progress: {video_progress_percentage:.1f}%")
+        # logger.info(f"   📤 Pipeline stages being sent: {response['pipeline_stages']}")
+        # logger.info(f"   📤 Queue sizes: {queue_sizes}")
         
         return response
         

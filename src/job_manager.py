@@ -95,7 +95,7 @@ async def process_creators_pipeline(job_id: str, urls: List[str], video_limit: i
             workers.append(worker)
         
         # Video transcript workers
-        for i in range(5):
+        for i in range(2):  # Reduced from 5 to 2 to prevent YouTube rate limiting
             worker = asyncio.create_task(
                 video_transcript_worker(i, video_queue, llm_queue, youtube_analyzer, timing_stats, job_id, analysis_results)
             )
@@ -230,6 +230,49 @@ async def monitor_job_completion(job_id: str, urls: List[str], workers: List[asy
         logger.error(f"Error in completion monitor for job {job_id}: {str(e)}")
         logger.error(traceback.format_exc())
 
+async def update_queue_wait_times(analysis_results: dict):
+    """Update estimated wait times for all queued jobs based on current progress"""
+    async with job_queue_lock:
+        global current_job_id
+        
+        if not job_queue or not current_job_id or current_job_id not in analysis_results:
+            return
+        
+        current_job = analysis_results[current_job_id]
+        
+        # Calculate current job's remaining time
+        current_progress = current_job['processed_urls'] / current_job['total_urls'] if current_job['total_urls'] > 0 else 0
+        current_remaining_urls = current_job['total_urls'] - current_job['processed_urls']
+        
+        # Estimate time per URL based on current job performance
+        elapsed_time = time.time() - current_job['performance_stats']['overall_start_time']
+        if current_job['processed_urls'] > 0:
+            time_per_url = elapsed_time / current_job['processed_urls']
+        else:
+            time_per_url = 30  # Default estimate: 30 seconds per URL
+        
+        # Calculate remaining time for current job
+        current_job_remaining_minutes = (current_remaining_urls * time_per_url) / 60
+        
+        # Update wait times for all queued jobs
+        for i, queued_job in enumerate(job_queue):
+            queued_job_id = queued_job['job_id']
+            
+            # Calculate time for jobs ahead in queue
+            jobs_ahead_time = 0
+            for j in range(i):
+                ahead_job = job_queue[j]
+                jobs_ahead_time += (len(ahead_job['urls']) * time_per_url) / 60
+            
+            # Total wait time = current job remaining + jobs ahead
+            total_wait_minutes = current_job_remaining_minutes + jobs_ahead_time
+            
+            # Update the job's wait time estimates
+            analysis_results[queued_job_id]['estimated_wait_minutes'] = max(1, int(total_wait_minutes))
+            analysis_results[queued_job_id]['estimated_start_time'] = (
+                datetime.now() + timedelta(minutes=total_wait_minutes)
+            ).isoformat()
+
 async def start_next_job(analysis_results: dict):
     """Start the next job in queue if any"""
     async with job_queue_lock:
@@ -240,14 +283,21 @@ async def start_next_job(analysis_results: dict):
             next_job = job_queue.pop(0)
             current_job_id = next_job['job_id']
             
-            # Update status
+            # Update status and reset queue position
             analysis_results[current_job_id]['status'] = 'processing'
             analysis_results[current_job_id]['queue_position'] = 0
+            analysis_results[current_job_id]['estimated_wait_minutes'] = 0
+            analysis_results[current_job_id]['estimated_start_time'] = None
+            
+            # Update queue positions for remaining jobs
+            for i, queued_job in enumerate(job_queue):
+                queued_job_id = queued_job['job_id']
+                analysis_results[queued_job_id]['queue_position'] = i + 1
             
             logger.info(f"🚀 Starting next queued job {current_job_id}")
             
-            # Start processing - NON-BLOCKING
-            asyncio.create_task(
+            # Start processing and track the task properly
+            task = asyncio.create_task(
                 process_creators_pipeline(
                     current_job_id,
                     next_job['urls'],
@@ -256,6 +306,9 @@ async def start_next_job(analysis_results: dict):
                     analysis_results
                 )
             )
+            
+            # Track task for cancellation - CRITICAL FIX
+            active_job_tasks[current_job_id] = [task]
 
 async def create_channel_summaries(job_id: str, analysis_results: dict):
     """Create channel summaries from individual video results"""

@@ -21,9 +21,9 @@ class YouTubeAnalyzer:
     def __init__(self, youtube_api_key=None):
         self.youtube_api_key = youtube_api_key
         
-        # Simple rate limiting to prevent IP blocking
-        self.max_concurrent_requests = int(os.getenv("YOUTUBE_MAX_CONCURRENT", "5"))  # Back to 5 concurrent
-        self.request_delay_seconds = float(os.getenv("YOUTUBE_REQUEST_DELAY", "0.5"))  # Just 0.5 second delay
+        # More aggressive rate limiting to prevent IP blocking
+        self.max_concurrent_requests = int(os.getenv("YOUTUBE_MAX_CONCURRENT", "2"))  # Reduced from 5 to 2
+        self.request_delay_seconds = float(os.getenv("YOUTUBE_REQUEST_DELAY", "3.0"))  # Increased from 2.0 to 3.0 seconds
         
         self.semaphore = asyncio.Semaphore(self.max_concurrent_requests)
         self.last_request_time = 0
@@ -334,9 +334,9 @@ class YouTubeAnalyzer:
         return videos
     
     async def get_transcript_async(self, video_id: str) -> Optional[Dict[str, Any]]:
-        """Get transcript for a YouTube video asynchronously with simple rate limiting"""
+        """Get transcript for a YouTube video asynchronously with aggressive rate limiting"""
         async with self.semaphore:  # Limit concurrent requests
-            # Simple rate limiting to prevent IP blocking
+            # Aggressive rate limiting to prevent IP blocking
             async with self.rate_limit_lock:
                 current_time = time.time()
                 
@@ -377,15 +377,25 @@ class YouTubeAnalyzer:
                     
                     logger.debug(f"✅ Successfully fetched transcript for {video_id} ({len(full_text)} chars)")
                     
+                    # Add small additional delay after successful request to be extra safe
+                    await asyncio.sleep(0.5)
+                    
                     return {
                         'full_text': full_text,
                         'segments': transcript_data
                     }
-            except (TranscriptsDisabled, NoTranscriptFound) as e:
-                logger.warning(f"No transcript available for video {video_id}: {str(e)}")
+            except (TranscriptsDisabled, NoTranscriptFound):
+                # Hide verbose logging for common transcript failures
+                logger.debug(f"No transcript available for video {video_id}")
                 return None
             except Exception as e:
-                logger.error(f"Error fetching transcript for video {video_id}: {str(e)}")
+                # Only log errors for unexpected failures, not common transcript issues
+                if "blocking requests" in str(e).lower() or "rate limit" in str(e).lower():
+                    logger.debug(f"YouTube rate limiting detected for video {video_id}")
+                    return {'error': str(e)}
+                else:
+                    # Hide most transcript errors as they're very common
+                    logger.debug(f"Transcript fetch failed for video {video_id}: {str(e)}")
                 return None
 
     def normalize_url(self, url: str) -> Tuple[str, str]:

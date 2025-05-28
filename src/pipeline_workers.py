@@ -390,8 +390,13 @@ async def video_transcript_worker(worker_id: int, video_queue: asyncio.Queue, ll
                         await asyncio.sleep(wait_time + jitter)
                         continue
                 
-            # Get work item
-            item = await video_queue.get()
+            # Get work item with timeout to prevent indefinite blocking
+            try:
+                item = await asyncio.wait_for(video_queue.get(), timeout=30.0)
+            except asyncio.TimeoutError:
+                logger.warning(f"🎬 Video Worker {worker_id}: Timeout waiting for work item, checking if job cancelled...")
+                continue
+            
             video_id = item['video_id']
             
             # Track retry attempts
@@ -444,8 +449,10 @@ async def video_transcript_worker(worker_id: int, video_queue: asyncio.Queue, ll
                         item['retry_count'] = retry_count + 1
                         await video_queue.put(item)
                         
-                        # Update pipeline stage back
+                        # Update pipeline stage back to queued for retry
                         update_pipeline_stage(job_id, 'fetching_transcripts', 'queued_for_transcripts', analysis_results=analysis_results)
+                        
+                        logger.info(f"🔄 Video Worker {worker_id}: Retrying video {video_id} (attempt {retry_count + 1}/{max_retries})")
                     
                     # CRITICAL: Mark the current task as done before retrying
                     video_queue.task_done()
@@ -476,6 +483,7 @@ async def video_transcript_worker(worker_id: int, video_queue: asyncio.Queue, ll
                         'controversy_check_failed': item.get('controversy_check_failed', False)  # Pass the flag
                     })
             else:
+                # Hide verbose logging for common transcript failures
                 logger.debug(f"❌ Video Worker {worker_id}: No transcript available for video {video_id}")
                 # Update pipeline stage: fetching transcripts -> failed (for this video)
                 update_pipeline_stage(job_id, 'fetching_transcripts', 'failed', analysis_results=analysis_results)
@@ -649,6 +657,9 @@ async def result_worker(worker_id: int, result_queue: asyncio.Queue, timing_stat
             # Mark task as done
             result_queue.task_done()
             
+            # After successfully processing the result, move from result_processing to completed
+            update_pipeline_stage(job_id, 'result_processing', 'completed', analysis_results=analysis_results)
+            
         except asyncio.CancelledError:
             break
         except Exception as e:
@@ -778,6 +789,33 @@ async def monitor_pipeline_detailed(job_id: str, channel_queue: asyncio.Queue = 
                         logger.info("🏁 All work completed, stopping monitor")
                         logger.info(f"📊 Final monitoring stats: {len(timing_stats['queue_depths']['channel'])} data points collected over {elapsed:.1f}s")
                         break
+                    
+                    # Deadlock detection: if we have items in transcript queue but no progress for a long time
+                    if video_size > 0 and elapsed > 300:  # 5 minutes
+                        # Check if we've made progress in the last 2 minutes
+                        recent_progress = False
+                        if len(timing_stats['timestamps']) >= 40:  # 40 * 3 seconds = 2 minutes
+                            old_processed = 0
+                            # Look at progress from 2 minutes ago
+                            for i, timestamp in enumerate(timing_stats['timestamps'][-40:]):
+                                if timestamp <= current_time - 120:  # 2 minutes ago
+                                    # Count processed at that time
+                                    old_completed = len(analysis_results[job_id]['results'])
+                                    old_failed = len(analysis_results[job_id]['failed_urls'])
+                                    old_processed = old_completed + old_failed
+                                    break
+                            
+                            if processed > old_processed:
+                                recent_progress = True
+                        
+                        if not recent_progress and video_size > 0:
+                            logger.warning(f"🚨 POTENTIAL DEADLOCK DETECTED:")
+                            logger.warning(f"   └─ {video_size} items stuck in transcript queue for >2 minutes")
+                            logger.warning(f"   └─ YouTube rate limiter status: blocked_until={youtube_rate_limiter.get('blocked_until')}")
+                            logger.warning(f"   └─ Current time: {time.time()}")
+                            if youtube_rate_limiter.get('blocked_until'):
+                                remaining_block = youtube_rate_limiter['blocked_until'] - time.time()
+                                logger.warning(f"   └─ Remaining block time: {remaining_block:.1f}s")
                         
                 except asyncio.CancelledError:
                     logger.info("🔍 Pipeline monitor cancelled")
@@ -914,10 +952,22 @@ async def process_job_with_cleanup(job_id: str, urls: List[str], video_limit: in
 
 async def clear_queues(queues: dict):
     """Clear all queues to prevent new work from being picked up"""
-    for queue in queues.values():
+    for queue_name, queue in queues.items():
+        items_removed = 0
         while not queue.empty():
             try:
                 queue.get_nowait()
-                queue.task_done()
+                items_removed += 1
             except asyncio.QueueEmpty:
-                break 
+                break
+        
+        # Only call task_done() for items we actually removed
+        for _ in range(items_removed):
+            try:
+                queue.task_done()
+            except ValueError:
+                # If we get "task_done() called too many times", stop calling it
+                break
+        
+        if items_removed > 0:
+            logger.debug(f"Cleared {items_removed} items from {queue_name}") 

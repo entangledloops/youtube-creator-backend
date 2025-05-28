@@ -2,12 +2,27 @@
 Version information for YouTube Content Compliance Analyzer
 """
 
-__version__ = "1.0.3"
-__version_info__ = (1, 0, 3)
-__build_date__ = "2025-05-27"
+__version__ = "1.0.4"
+__version_info__ = (1, 0, 4)
+__build_date__ = "2025-05-28"
 
 # Version history
 VERSION_HISTORY = {
+    "1.0.4": {
+        "date": "2025-05-28",
+        "changes": [
+            "Fixed task_done() error in job cancellation by tracking items removed from queues",
+            "Fixed 'completed' counter issue by properly moving items from result_processing to completed stage",
+            "Improved transcript worker retry logic to handle YouTube rate limiting without permanent failures",
+            "Added better error handling for transcript failures that aren't rate limit related",
+            "Reduced verbose logging in status endpoint and transcript failures to minimize log noise",
+            "Increased YouTube rate limiting backoff times (180s initial, 900s max) to prevent IP bans",
+            "Reduced max concurrent transcript requests from 5 to 2 and increased delay from 2.0s to 3.0s",
+            "Added deadlock detection to pipeline monitor for stuck transcript queues",
+            "Added timeout handling to video transcript workers to prevent indefinite blocking",
+            "Updated environment variable documentation for new rate limiting settings"
+        ]
+    },
     "1.0.3": {
         "date": "2025-05-27",
         "changes": [
