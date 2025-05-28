@@ -123,6 +123,7 @@ class YouTubeAnalyzer:
         try:
             # Track API call
             youtube_rate_limiter['total_api_calls'] += 1
+            logger.debug(f"📊 Channel info API call #{youtube_rate_limiter['total_api_calls']} for channel {channel_id}")
             
             url = "https://www.googleapis.com/youtube/v3/channels"
             params = {
@@ -131,18 +132,33 @@ class YouTubeAnalyzer:
                 "part": "snippet"
             }
             
+            logger.debug(f"🌐 Making YouTube channel info API request")
             response = requests.get(url, params=params)
+            
+            if response.status_code != 200:
+                logger.error(f"❌ YouTube channel info API error: {response.status_code} - {response.text}")
+                return None
+            
             data = response.json()
+            
+            if 'error' in data:
+                logger.error(f"❌ YouTube channel info API returned error: {data['error']}")
+                return None
             
             if 'items' in data and data['items']:
                 snippet = data['items'][0]['snippet']
-                return {
+                result = {
                     'title': snippet.get('title'),
                     'customUrl': snippet.get('customUrl')
                 }
-            return None
+                logger.debug(f"✅ Successfully got channel info from API: {result['title']}")
+                return result
+            else:
+                logger.warning(f"⚠️ No channel info found in API response for {channel_id}")
+                return None
+                
         except Exception as e:
-            logger.error(f"Error getting channel info from API: {str(e)}")
+            logger.error(f"💥 Exception in YouTube channel info API call: {str(e)}")
             return None
     
     def get_channel_info_from_video(self, video_id):
@@ -287,11 +303,14 @@ class YouTubeAnalyzer:
         try:
             # If YouTube API key is available, use the API
             if self.youtube_api_key:
+                logger.debug(f"🔑 YouTube API key available, attempting API call for channel {channel_id}")
                 videos = self._get_videos_from_api(channel_id, limit)
                 if videos:
                     logger.info(f"Found {len(videos)} videos through API")
                     return videos
                 logger.warning("API returned no videos, falling back to scraping")
+            else:
+                logger.debug(f"🚫 No YouTube API key available, using scraping for channel {channel_id}")
             
             # Otherwise, or if API failed, scrape the channel page
             videos = self._get_videos_by_scraping(channel_id, limit)
@@ -305,33 +324,53 @@ class YouTubeAnalyzer:
             
     def _get_videos_from_api(self, channel_id, limit):
         """Get videos using YouTube API"""
-        # Track API call
-        youtube_rate_limiter['total_api_calls'] += 1
-        
-        url = f"https://www.googleapis.com/youtube/v3/search"
-        params = {
-            "key": self.youtube_api_key,
-            "channelId": channel_id,
-            "part": "snippet",
-            "order": "date",
-            "maxResults": limit,
-            "type": "video"
-        }
-        
-        response = requests.get(url, params=params)
-        data = response.json()
-        
-        videos = []
-        for item in data.get("items", []):
-            video_id = item["id"]["videoId"]
-            title = item["snippet"]["title"]
-            videos.append({
-                "id": video_id,
-                "title": title,
-                "url": f"https://www.youtube.com/watch?v={video_id}"
-            })
+        try:
+            # Track API call
+            youtube_rate_limiter['total_api_calls'] += 1
+            logger.debug(f"📊 API call #{youtube_rate_limiter['total_api_calls']} for channel {channel_id}")
             
-        return videos
+            url = f"https://www.googleapis.com/youtube/v3/search"
+            params = {
+                "key": self.youtube_api_key,
+                "channelId": channel_id,
+                "part": "snippet",
+                "order": "date",
+                "maxResults": limit,
+                "type": "video"
+            }
+            
+            logger.debug(f"🌐 Making YouTube API request to: {url}")
+            response = requests.get(url, params=params)
+            
+            if response.status_code != 200:
+                logger.error(f"❌ YouTube API error: {response.status_code} - {response.text}")
+                return []
+            
+            data = response.json()
+            
+            if 'error' in data:
+                logger.error(f"❌ YouTube API returned error: {data['error']}")
+                return []
+            
+            videos = []
+            items = data.get("items", [])
+            logger.debug(f"📺 YouTube API returned {len(items)} items for channel {channel_id}")
+            
+            for item in items:
+                video_id = item["id"]["videoId"]
+                title = item["snippet"]["title"]
+                videos.append({
+                    "id": video_id,
+                    "title": title,
+                    "url": f"https://www.youtube.com/watch?v={video_id}"
+                })
+            
+            logger.debug(f"✅ Successfully processed {len(videos)} videos from API")
+            return videos
+            
+        except Exception as e:
+            logger.error(f"💥 Exception in YouTube API call: {str(e)}")
+            return []
     
     async def get_transcript_async(self, video_id: str) -> Optional[Dict[str, Any]]:
         """Get transcript for a YouTube video asynchronously with aggressive rate limiting"""

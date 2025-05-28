@@ -12,6 +12,7 @@ from src.youtube_analyzer import YouTubeAnalyzer
 from src.llm_analyzer import LLMAnalyzer
 from src.rate_limiter import youtube_rate_limiter
 from src.controversy_screener import screen_creator_for_controversy
+from src.video_cache import video_cache
 
 logger = logging.getLogger(__name__)
 
@@ -398,6 +399,7 @@ async def video_transcript_worker(worker_id: int, video_queue: asyncio.Queue, ll
                 continue
             
             video_id = item['video_id']
+            video_url = item['video_url']
             
             # Track retry attempts
             retry_count = item.get('retry_count', 0)
@@ -408,6 +410,59 @@ async def video_transcript_worker(worker_id: int, video_queue: asyncio.Queue, ll
             # Update pipeline stage: queued for transcripts -> fetching transcripts
             update_pipeline_stage(job_id, 'queued_for_transcripts', 'fetching_transcripts', analysis_results=analysis_results)
             
+            logger.debug(f"🎬 Video Worker {worker_id}: Processing video {video_id}")
+            
+            # CHECK CACHE FIRST
+            cached_result = video_cache.get_cached_result(video_url)
+            if cached_result:
+                logger.info(f"🎯 Cache hit for video {video_id}: {item['video_title']}")
+                
+                # Update cache hit counter
+                analysis_results[job_id]['video_progress']['cache_hits'] += 1
+                analysis_results[job_id]['video_progress']['videos_with_transcripts'] += 1
+                analysis_results[job_id]['video_progress']['videos_analyzed_by_llm'] += 1
+                analysis_results[job_id]['video_progress']['videos_completed'] += 1
+                
+                # Skip transcript and LLM processing - go directly to results
+                # Update pipeline stages to reflect cache hit
+                update_pipeline_stage(job_id, 'fetching_transcripts', 'completed', analysis_results=analysis_results)
+                
+                # Create result entry directly from cache
+                result_item = {
+                    'url': item['url'],  # Original channel URL
+                    'video_id': video_id,
+                    'video_title': item['video_title'],
+                    'video_url': video_url,
+                    'video_analysis': cached_result['llm_result'],
+                    'transcript': cached_result['transcript'],
+                    'channel_id': item['channel_id'],
+                    'channel_name': item['channel_name'],
+                    'channel_handle': item['channel_handle'],
+                    'start_time': time.time(),
+                    'controversy_check_failed': item.get('controversy_check_failed', False),
+                    'cache_hit': True
+                }
+                
+                # Get result queue from active job tasks
+                result_queue = None
+                if job_id in globals().get('active_job_tasks', {}):
+                    for task in globals()['active_job_tasks'][job_id]:
+                        if hasattr(task, 'get_queues'):
+                            queues = task.get_queues()
+                            if queues and 'result_queue' in queues:
+                                result_queue = queues['result_queue']
+                                break
+                
+                if result_queue:
+                    await result_queue.put(result_item)
+                    logger.debug(f"✅ Cache result queued for video {video_id}")
+                else:
+                    logger.warning(f"⚠️ Could not find result queue for cached video {video_id}")
+                
+                video_queue.task_done()
+                continue
+            
+            # NO CACHE HIT - Proceed with normal transcript fetching
             logger.debug(f"🎬 Video Worker {worker_id}: Fetching transcript for video {video_id}")
             
             # Track the request
@@ -654,6 +709,22 @@ async def result_worker(worker_id: int, result_queue: asyncio.Queue, timing_stat
             # Update pipeline stage: queued for results -> result processing
             update_pipeline_stage(job_id, 'queued_for_results', 'result_processing', analysis_results=analysis_results)
             
+            # Store result in cache for future use (unless it's already a cache hit)
+            if not item.get('cache_hit', False):
+                cache_stored = video_cache.store_result(
+                    video_url=video_url,
+                    video_id=video_id,
+                    video_title=video_title,
+                    channel_id=channel_id,
+                    channel_name=channel_name,
+                    transcript=transcript,
+                    llm_result=video_analysis
+                )
+                if cache_stored:
+                    logger.debug(f"💾 Stored video {video_id} in cache")
+                else:
+                    logger.warning(f"⚠️ Failed to store video {video_id} in cache")
+            
             # Mark task as done
             result_queue.task_done()
             
@@ -714,6 +785,7 @@ async def monitor_pipeline_detailed(job_id: str, channel_queue: asyncio.Queue = 
         logger.info(f"📊 Job {job_id} progress update:")
         logger.info(f"   📈 Channel progress: {len(job['results'])}/{job['total_urls']} channels processed")
         logger.info(f"   📊 Video progress: {job.get('video_progress', {}).get('videos_completed', 0)}/{job.get('video_progress', {}).get('total_videos_discovered', 0)} videos completed")
+        logger.info(f"   🎯 Cache hits: {job.get('video_progress', {}).get('cache_hits', 0)} videos from cache")
         logger.info(f"   ⏱️ ETA: {eta_info.get('estimated_minutes_remaining', 'N/A')} minutes remaining")
 
         # If we're in full monitoring mode (all parameters provided)

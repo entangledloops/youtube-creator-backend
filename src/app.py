@@ -36,6 +36,7 @@ from src.export_handlers import (
     download_failed_urls_csv
 )
 from src.pipeline_workers import calculate_job_eta
+from src.video_cache import video_cache
 
 # Configure logging
 logging.basicConfig(
@@ -135,7 +136,7 @@ analysis_results = {}
 
 # Background task for monitoring abandoned jobs
 abandoned_job_monitor_task = None
-ABANDONED_JOB_TIMEOUT = 30  # seconds
+ABANDONED_JOB_TIMEOUT = 120  # seconds (2 minutes)
 
 async def monitor_abandoned_jobs():
     """Background task to monitor and cancel abandoned jobs"""
@@ -215,6 +216,19 @@ async def get_version():
         "build_date": __build_date__,
         "version_history": VERSION_HISTORY
     }
+
+@app.get("/api/cache/stats")
+async def get_cache_stats():
+    """Get video cache statistics"""
+    try:
+        stats = video_cache.get_cache_stats()
+        return {
+            "cache_stats": stats,
+            "status": "success"
+        }
+    except Exception as e:
+        logger.error(f"Error getting cache stats: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/analyze-creator", response_model=AnalysisResponse)
 async def analyze_creator(request: CreatorAnalysisRequest):
@@ -414,7 +428,8 @@ async def bulk_analyze(
                 'total_videos_discovered': 0,
                 'videos_with_transcripts': 0,
                 'videos_analyzed_by_llm': 0,
-                'videos_completed': 0
+                'videos_completed': 0,
+                'cache_hits': 0  # Track cache hits
             },
             
             # Detailed pipeline stage tracking
@@ -572,6 +587,7 @@ async def get_bulk_analysis_status(job_id: str):
         videos_with_transcripts = video_progress.get('videos_with_transcripts', 0)
         videos_analyzed = video_progress.get('videos_analyzed_by_llm', 0)
         videos_completed = video_progress.get('videos_completed', 0)
+        cache_hits = video_progress.get('cache_hits', 0)
         video_progress_percentage = (videos_completed / total_videos * 100) if total_videos > 0 else 0
         
         # Calculate ETA using shared function
@@ -635,7 +651,8 @@ async def get_bulk_analysis_status(job_id: str):
                 "videos_with_transcripts": videos_with_transcripts,
                 "videos_analyzed_by_llm": videos_analyzed,
                 "videos_completed": videos_completed,
-                "video_percentage": video_progress_percentage
+                "video_percentage": video_progress_percentage,
+                "cache_hits": cache_hits
             },
             
             # Detailed pipeline stage breakdown

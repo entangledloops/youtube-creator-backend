@@ -2,12 +2,27 @@
 Version information for YouTube Content Compliance Analyzer
 """
 
-__version__ = "1.0.4"
-__version_info__ = (1, 0, 4)
+__version__ = "1.1.0"
+__version_info__ = (1, 1, 0)
 __build_date__ = "2025-05-28"
 
 # Version history
 VERSION_HISTORY = {
+    "1.1.0": {
+        "date": "2025-05-28",
+        "changes": [
+            "Added SQLite-based video cache system to store transcripts and LLM results for 30-day reuse",
+            "Implemented automatic cache lookup before transcript fetching to skip duplicate processing",
+            "Added cache hit tracking and reporting in job progress and detailed logging",
+            "Created cache statistics endpoint (/api/cache/stats) for monitoring cache performance",
+            "Enhanced YouTube API call logging and error handling for better debugging",
+            "Fixed YouTube API counter tracking with improved logging and error detection",
+            "Added automatic cache expiration and cleanup of entries older than 30 days",
+            "Cached results bypass transcript and LLM processing, going directly to results queue",
+            "Cache system uses URL hashing for fast lookups and includes database indexing",
+            "Added cache hit counter to video progress tracking in job status responses"
+        ]
+    },
     "1.0.4": {
         "date": "2025-05-28",
         "changes": [
