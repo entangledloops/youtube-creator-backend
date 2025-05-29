@@ -72,63 +72,67 @@ class LLMAnalyzer:
         categories = self._prepare_categories_prompt()
         
         # Calculate rough prompt size without transcript
-        base_prompt = f"""You are a content compliance analyzer focused on identifying BLATANT and SERIOUS violations only.
+        base_prompt = f"""
+You are a content compliance analyst tasked with identifying **clear and serious** violations in YouTube video transcripts. Your goal is to provide **detailed, conservative scores** for each compliance category.
 
-CRITICAL INSTRUCTIONS: You are looking for CLEAR, OBVIOUS, and SERIOUS violations. Be very conservative in your scoring. When in doubt, score lower or don't include the category at all.
+---
 
-TASK: Evaluate the following YouTube video transcript against each content compliance category. For each category, provide a score from 0 to 1, where:
+### SCORING SCALE
+Assign a score between 0.0 and 1.0 for each category:
+- **0.0**: No violation
+- **0.1–0.2**: Very minor concerns
+- **0.3–0.5**: Moderate, clear violations
+- **0.6–0.8**: Serious, repeated, or overtly harmful violations
+- **0.9–1.0**: Egregious, dangerous, or extreme violations
 
-SCORING SCALE (BE VERY CONSERVATIVE):
-- 0.0: No violation detected
-- 0.1-0.2: Very minor instances that barely qualify as violations
-- 0.3-0.5: Clear violations that are moderate in severity
-- 0.6-0.8: Serious, repeated, or clearly harmful violations
-- 0.9-1.0: Extreme, dangerous, or egregious violations only
+---
 
-STRICT EVALUATION CRITERIA:
-- IGNORE casual profanity, mild language, entertainment banter, comedy content, and normal social conversation
-- IGNORE single instances of borderline content - look for patterns or severity
-- ONLY flag content that is clearly harmful, dangerous, illegal, or extremely inappropriate
-- Consider the INTENT and CONTEXT - educational, entertainment, and casual discussion should be scored very leniently
-- For language violations: Only flag excessive, aggressive, hateful, or targeted offensive language
-- For violence/harm: Only flag content that actively promotes or instructs dangerous behavior
-- For adult content: Only flag explicit sexual content, not mild suggestive themes
-- For illegal activities: Only flag clear promotion or instruction of illegal acts
+### EVALUATION PRINCIPLES
+- Focus on **serious, harmful, or illegal** content.
+- Ignore casual profanity, normal banter, comedy, or minor infractions.
+- Context and intent matter. Be lenient with educational or entertainment content.
+- Only flag targeted, aggressive, explicit, or repeated problematic content.
 
-CONTENT TOLERANCE:
-- Normal YouTube entertainment content should rarely score above 0.2
-- Comedy, gaming, vlogging, lifestyle content should be evaluated very leniently  
-- Educational content discussing sensitive topics should not be penalized
-- Reaction videos, commentary, and discussion should not be penalized for mentioning topics
+---
 
-VIDEO TITLE: {video_title}
+### CONTENT GUIDANCE
+- Do **not** penalize:
+  - Reaction/commentary videos mentioning sensitive topics
+  - Comedy, lifestyle, or gaming content with minor edgy language
+  - Educational discussions of controversial issues
+- Only flag:
+  - Harmful misinformation
+  - Repeated hate speech or dangerous behavior
+  - Instructional or promotional illegal activity
+  - Explicit or abusive content
 
-CONTENT COMPLIANCE CATEGORIES:
+---
+
+### VIDEO TITLE
+{video_title}
+
+### CATEGORIES TO SCORE
 {categories}
 
-TRANSCRIPT:
+### TRANSCRIPT
 PLACEHOLDER_FOR_TRANSCRIPT
 
-INSTRUCTIONS:
-1. For EACH category listed above, provide a score ONLY if there are CLEAR, SERIOUS violations:
-   - Score (0-1) - Be conservative, when in doubt score lower or exclude
-   - Brief justification explaining why this is a serious violation
-   - Quote the most problematic text found
+---
 
-2. Your response MUST be a valid JSON object with this structure:
+### OUTPUT FORMAT (Always include every category, even if score is 0.0)
+Respond with a valid JSON object in the following format:
 {{
   "Category Name": {{
-    "score": 0.5,
-    "justification": "Reason why this is a serious violation",
-    "evidence": ["clear problematic quote1", "clear problematic quote2"]
-  }}
+    "score": 0.0,
+    "justification": "Brief reasoning for the score",
+    "evidence": ["Example quote 1", "Example quote 2"]
+  }},
+  ...
 }}
 
-3. ONLY include categories where you found SERIOUS violations (score > 0.2).
-4. If content is borderline, educational, entertainment, or minor, DO NOT include it.
-5. If no serious violations found at all, return an empty JSON object: {{}}
-6. Ensure all JSON is properly formatted with double quotes around keys and string values.
-7. REMEMBER: It's better to miss minor violations than to flag normal content. Be conservative.
+All categories must be included in the JSON response. If no violations exist, score should be 0.0 with minimal justification.
+
+---
 """
         
         # Estimate tokens used by base prompt (roughly 4 chars per token)

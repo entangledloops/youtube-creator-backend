@@ -87,7 +87,7 @@ async def download_bulk_analysis_csv(job_id: str, analysis_results: dict):
         row['overall_score'] = round(row['overall_score'], 2)
         
         # Determine status based on threshold
-        if row['overall_score'] >= 0.8:
+        if row['overall_score'] >= 0.6:
             row['status'] = 'FAIL'
         else:
             row['status'] = 'PASS'

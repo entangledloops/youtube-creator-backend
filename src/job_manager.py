@@ -224,11 +224,29 @@ async def monitor_job_completion(job_id: str, urls: List[str], workers: List[asy
                 pipeline_stages.get('result_processing', 0)
             )
             
+            # IMPROVED COMPLETION LOGIC: Use video completion when available
+            # Check if we have video progress data for more accurate completion tracking
+            video_progress = analysis_results[job_id].get('video_progress', {})
+            total_videos_discovered = video_progress.get('total_videos_discovered', 0)
+            videos_completed = video_progress.get('videos_completed', 0)
+            
+            # Determine completion based on available data
+            if total_videos_discovered > 0:
+                # Use video-based completion (more accurate)
+                all_work_complete = videos_completed >= total_videos_discovered
+                completion_type = "video-based"
+                completion_info = f"{videos_completed}/{total_videos_discovered} videos completed"
+            else:
+                # Fallback to URL-based completion for early stages
+                all_work_complete = all_urls_processed
+                completion_type = "URL-based"
+                completion_info = f"{total_processed}/{len(urls)} URLs processed"
+            
             # Job is complete when:
-            # 1. All URLs are processed (in results or failed_urls)
+            # 1. All work is complete (videos or URLs)
             # 2. All queues are empty
             # 3. No channels are still in processing stages
-            job_complete = all_urls_processed and all_queues_empty and channels_still_processing == 0
+            job_complete = all_work_complete and all_queues_empty and channels_still_processing == 0
             
             # DEBUG: Log detailed completion status when we're close to completion
             if all_queues_empty and not job_complete:
@@ -238,13 +256,16 @@ async def monitor_job_completion(job_id: str, urls: List[str], workers: List[asy
                 logger.warning(f"   └─ Failed URLs: {len(analysis_results[job_id]['failed_urls'])}")
                 logger.warning(f"   └─ Total processed: {total_processed}")
                 logger.warning(f"   └─ All URLs processed: {all_urls_processed}")
+                logger.warning(f"   └─ Completion type: {completion_type}")
+                logger.warning(f"   └─ Completion info: {completion_info}")
+                logger.warning(f"   └─ All work complete: {all_work_complete}")
                 logger.warning(f"   └─ Channels still processing: {channels_still_processing}")
                 logger.warning(f"   └─ Pipeline stages: {pipeline_stages}")
                 
-                # If all URLs are processed but we still have channels in processing stages,
+                # If all work is complete but we still have channels in processing stages,
                 # this indicates a pipeline tracking issue
-                if all_urls_processed and channels_still_processing > 0:
-                    logger.warning(f"   └─ PIPELINE TRACKING ISSUE: All URLs processed but {channels_still_processing} channels still in processing stages")
+                if all_work_complete and channels_still_processing > 0:
+                    logger.warning(f"   └─ PIPELINE TRACKING ISSUE: All work complete but {channels_still_processing} channels still in processing stages")
                     logger.warning(f"   └─ This may indicate a race condition or tracking bug")
                     # Continue without sleeping - the pipeline stages should resolve themselves
                     continue
@@ -343,7 +364,7 @@ async def monitor_job_completion(job_id: str, urls: List[str], workers: List[asy
             
             # Check for job completion with improved logic
             if job_complete:
-                logger.info(f"✅ Job {job_id} completed - all URLs processed and no channels still processing")
+                logger.info(f"✅ Job {job_id} completed - {completion_info} and no channels still processing")
                 
                 # Mark job as completed
                 analysis_results[job_id]['status'] = 'completed'

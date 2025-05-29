@@ -124,6 +124,7 @@ class VideoCache:
             
         try:
             url_hash = self._get_url_hash(video_url)
+            logger.info(f"🔍 CACHE DEBUG: Looking up full cache for URL: {video_url} (hash: {url_hash})")
             
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
@@ -155,7 +156,7 @@ class VideoCache:
                     transcript = json.loads(transcript_json)
                     llm_result = json.loads(llm_result_json)
                     
-                    logger.debug(f"✅ Cache hit for video {video_id}: {video_title}")
+                    logger.info(f"✅ CACHE HIT for video {video_id}: {video_title}")
                     
                     return {
                         'video_id': video_id,
@@ -169,6 +170,7 @@ class VideoCache:
                         'cache_hit': True
                     }
                 
+                logger.info(f"❌ CACHE MISS for URL: {video_url}")
                 return None
                 
         except Exception as e:
