@@ -2,12 +2,201 @@
 Version information for YouTube Content Compliance Analyzer
 """
 
-__version__ = "1.1.0"
-__version_info__ = (1, 1, 0)
-__build_date__ = "2025-05-28"
+__version__ = "1.2.6"
+__version_info__ = (1, 2, 6)
+__build_date__ = "2025-05-29"
 
 # Version history
 VERSION_HISTORY = {
+    "1.2.6": {
+        "date": "2025-05-29",
+        "changes": [
+            "CRITICAL FIX: Fixed race condition where channels were counted twice (in both results and failed_urls)",
+            "Fixed 'pipeline tracking error' for channels that were still being processed when completion check ran",
+            "Added safeguard to only check for missing URLs when NO channels are still in processing stages",
+            "Result worker now removes URLs from failed_urls if they complete successfully after being marked as missing",
+            "Prevents double-counting that caused '10 out of 8 URLs processed' type errors",
+            "Fixed timing issue where @handle URLs were marked as failed while still in controversy screening"
+        ]
+    },
+    "1.2.5": {
+        "date": "2025-05-29",
+        "changes": [
+            "CRITICAL FIX: Fixed double-counting URLs bug that caused 10/8 completion (125%)",
+            "Added duplicate URL checks in job completion monitor to prevent adding URLs to failed_urls twice",
+            "CRITICAL FIX: Fixed queue management bug where current_job_id wasn't properly shared between modules",
+            "Changed current_job_id import to access through module reference instead of direct import",
+            "Fixed Python module-level variable import issue that caused new jobs to queue indefinitely",
+            "Enhanced debugging to track when URLs are added to failed_urls vs missing URL detection",
+            "Prevents 'pipeline tracking error' duplicates by checking if URL already exists in failed_urls"
+        ]
+    },
+    "1.2.4": {
+        "date": "2025-05-29",
+        "changes": [
+            "Added comprehensive debugging for queue management and pipeline tracking issues",
+            "Enhanced logging to track when URLs are added to failed_urls vs missing URL detection",
+            "Added debugging for current_job_id state and job queue transitions",
+            "Improved pipeline tracking error diagnosis with detailed failed_urls logging",
+            "Added timing analysis for channel discovery failures vs job completion monitoring",
+            "Enhanced debugging output for @handle URL resolution and channel access issues"
+        ]
+    },
+    "1.2.3": {
+        "date": "2025-05-29",
+        "changes": [
+            "CRITICAL FIX: Fixed queue management bug where current_job_id was reset to None but never set to next job",
+            "start_next_job() now properly sets current_job_id to the next job ID instead of leaving it None",
+            "Fixed issue where second job would queue even when no jobs were actually running",
+            "Improved queue state management to properly track when jobs are running vs when queue is empty",
+            "Added logging to indicate when queue is empty and ready for new jobs",
+            "Removed redundant current_job_id reset logic that was causing the queue management bug"
+        ]
+    },
+    "1.2.2": {
+        "date": "2025-05-29",
+        "changes": [
+            "CRITICAL FIX: Fixed queue management bug where current_job_id wasn't reset after job completion",
+            "New jobs no longer incorrectly wait in queue when no jobs are actually running",
+            "Added DELETE /api/bulk-analyze/cancel-all endpoint to cancel all ongoing jobs and clear queue",
+            "Cancel-all API provides detailed summary of cancelled jobs (active vs queued)",
+            "Improved job completion cleanup to properly reset global job state",
+            "Enhanced logging for job queue state transitions and cancellations"
+        ]
+    },
+    "1.2.1": {
+        "date": "2025-05-29",
+        "changes": [
+            "CRITICAL FIX: Fixed race condition in job completion logic that caused channels to be marked as failed",
+            "Job completion now properly waits for all channels to finish processing, not just empty queues",
+            "Fixed issue where cache hits completed instantly while normal processing was still ongoing",
+            "Enhanced job completion monitor to check pipeline stages for channels still being processed",
+            "Improved debugging output for job completion detection and pipeline tracking issues",
+            "Prevents premature job completion when some channels are still in controversy screening or video processing",
+            "Fixed 'pipeline tracking error' failures for channels that were actually still being processed"
+        ]
+    },
+    "1.2.0": {
+        "date": "2025-05-29",
+        "changes": [
+            "CRITICAL FIX: DISABLE_VIDEO_CACHE now properly disables all cache usage (was still checking cache)",
+            "Added CACHE_TRANSCRIPTS_ONLY environment variable for transcript-only caching mode",
+            "Transcript-only mode reuses cached transcripts but forces fresh LLM analysis",
+            "Enhanced cache system with separate methods for full cache vs transcript-only cache",
+            "Improved cache statistics to show current cache mode (disabled/transcript_only/full_cache)",
+            "Fixed cache storage logic to respect environment flags properly",
+            "Added proper logging to indicate cache mode and storage behavior",
+            "Cache system now supports three modes: disabled, transcript-only, and full caching"
+        ]
+    },
+    "1.1.9": {
+        "date": "2025-05-29",
+        "changes": [
+            "CRITICAL FIX: Added channel name scraping fallback when YouTube API is blocked (403 errors)",
+            "Enhanced controversy screening to extract creator names from URLs when API fails",
+            "Fixed 'Unknown' channel names in controversy screening by scraping channel pages",
+            "Added YouTube URL context to controversy screening for better LLM analysis",
+            "Improved channel info extraction with multiple fallback methods for name resolution",
+            "Enhanced controversy screening to handle cases where API returns no channel data",
+            "Fixed controversy screening effectiveness when YouTube API access is restricted",
+            "Added robust channel name extraction from og:title, page titles, and JSON-LD metadata"
+        ]
+    },
+    "1.1.8": {
+        "date": "2025-05-29",
+        "changes": [
+            "MAJOR FIX: Controversial channels now properly show as FAIL with High Risk (1.0) score instead of ERROR",
+            "Controversial channels now display actual LLM controversy reasons instead of generic messages",
+            "Added proper 'Controversy or Cancelled Creators' category scoring for controversial channels",
+            "Controversial channels now appear in results section with proper analysis structure, not failed_urls",
+            "Fixed CSV exports to show controversial channels as FAIL with 1.0 score and controversy category marked",
+            "Enhanced controversy screening to create proper video analysis and summary structures",
+            "Controversial channels now stay in results throughout the pipeline instead of being moved to failed_urls",
+            "Improved job completion logic to handle controversial channels in results properly"
+        ]
+    },
+    "1.1.7": {
+        "date": "2025-05-29",
+        "changes": [
+            "MAJOR IMPROVEMENT: Fixed controversy handling to use actual LLM reasons instead of generic messages",
+            "Controversial channels now immediately fail with specific controversy reasons from LLM analysis",
+            "Changed controversy failures from 'ERROR' type to 'FAIL' type with proper categorization",
+            "Enhanced missing URL detection to properly categorize different failure types",
+            "Controversial channels no longer have their videos processed - they fail immediately with LLM reason",
+            "Improved error messages to show actual controversy screening results",
+            "Better distinction between controversy failures, processing failures, and screening errors"
+        ]
+    },
+    "1.1.6": {
+        "date": "2025-05-28",
+        "changes": [
+            "PROPER FIX: Fixed job completion tracking by ensuring all processed URLs are counted",
+            "Removed forced completion timer in favor of proper channel completion tracking",
+            "Added missing URL detection and automatic addition to failed_urls when queues are empty",
+            "Fixed edge case where channels passed controversy screening but never got counted as completed",
+            "Enhanced completion logic to handle channels with no successful video analyses",
+            "Improved debugging output for completion detection issues",
+            "Ensures frontend gets accurate progress updates by properly tracking all channel outcomes"
+        ]
+    },
+    "1.1.5": {
+        "date": "2025-05-28",
+        "changes": [
+            "CRITICAL FIX: Added forced completion mechanism for jobs stuck at 7/8 channels with empty queues",
+            "Added detailed debugging for job completion detection to identify missing URLs",
+            "Implemented 30-second timeout fallback to force completion when queues are empty but URLs missing",
+            "Enhanced job completion monitor with missing URL detection and controversy check failure analysis",
+            "Fixed edge case where channels with processed videos weren't being counted as completed",
+            "Added comprehensive logging to debug completion detection issues",
+            "Prevents indefinite hanging when pipeline stages don't properly track channel completion"
+        ]
+    },
+    "1.1.4": {
+        "date": "2025-05-28",
+        "changes": [
+            "CRITICAL FIX: Fixed cache hit processing that was causing jobs to hang at 7/8 completion",
+            "Fixed 'Could not find result queue for cached video' error that prevented cache hits from being processed",
+            "Improved cache hit handling by passing result_queue directly to video transcript workers",
+            "Enhanced fallback logic for cache hits when queue lookup fails",
+            "Fixed pipeline stage tracking for cache hits to properly flow through result processing",
+            "Cache hits now properly increment videos_completed counter and trigger job completion",
+            "Eliminated frontend hanging when cache hits occur by ensuring proper result queue processing"
+        ]
+    },
+    "1.1.3": {
+        "date": "2025-05-28",
+        "changes": [
+            "Increased transcript workers from 2 to 3 for improved processing speed",
+            "Added DISABLE_VIDEO_CACHE environment variable to bypass caching during testing",
+            "Fixed channel access issues for @handle URLs by implementing handle resolution",
+            "Added scraping-based resolution for @handles, /c/ custom URLs, and /user/ legacy URLs",
+            "Improved channel name extraction for all URL formats",
+            "Enhanced error handling and logging for channel resolution failures",
+            "Fixed 'Failed to access YouTube channel' errors for valid channels with handles"
+        ]
+    },
+    "1.1.2": {
+        "date": "2025-05-28",
+        "changes": [
+            "Fixed critical CSV export scoring bug - scores now properly calculated from video analyses when summary is missing",
+            "Added fallback score calculation for cancelled/partial jobs that don't have summary data",
+            "CSV exports now show correct scores instead of all zeros for incomplete jobs",
+            "Enhanced CSV export logging to indicate when fallback calculation is used",
+            "Improved score calculation accuracy for partial results downloads"
+        ]
+    },
+    "1.1.1": {
+        "date": "2025-05-28",
+        "changes": [
+            "Fixed transcript queue stuck issue when retries are exhausted - properly handle task_done() calls",
+            "Fixed cache hit frontend update issue - improved result queue lookup and fallback handling",
+            "Fixed YouTube API counter accuracy - only count actual successful API requests, not hypothetical calls",
+            "Improved error handling in transcript worker retry logic to prevent deadlocks",
+            "Enhanced cache hit processing to properly flow through pipeline stages",
+            "Removed misleading API call tracking for unimplemented handle/username resolution",
+            "Added better logging and error detection for YouTube API call failures"
+        ]
+    },
     "1.1.0": {
         "date": "2025-05-28",
         "changes": [

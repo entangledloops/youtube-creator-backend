@@ -152,6 +152,8 @@ async def channel_discovery_worker(worker_id: int, channel_queue: asyncio.Queue,
                     'error': error_msg,
                     'error_type': 'invalid_channel'
                 })
+                logger.info(f"🔍 FAILED_URLS DEBUG: Added {url} to failed_urls (invalid_channel) - total failed: {len(analysis_results[job_id]['failed_urls'])}")
+                
                 # Mark task as done
                 channel_queue.task_done()
                 logger.debug(f"📋 Channel Worker {worker_id}: Marked invalid channel as done (queue size: {channel_queue.qsize()})")
@@ -174,6 +176,8 @@ async def channel_discovery_worker(worker_id: int, channel_queue: asyncio.Queue,
                         'error_type': 'no_videos',
                         'channel_name': channel_name or 'Unknown'
                     })
+                    logger.info(f"🔍 FAILED_URLS DEBUG: Added {url} to failed_urls (no_videos) - total failed: {len(analysis_results[job_id]['failed_urls'])}")
+                    
                     # Mark task as done
                     channel_queue.task_done()
                     logger.debug(f"📋 Channel Worker {worker_id}: Marked no-videos channel as done (queue size: {channel_queue.qsize()})")
@@ -217,6 +221,8 @@ async def channel_discovery_worker(worker_id: int, channel_queue: asyncio.Queue,
                 'error': error_msg,
                 'error_type': 'channel_discovery_error'
             })
+            logger.info(f"🔍 FAILED_URLS DEBUG: Added {url} to failed_urls (channel_discovery_error) - total failed: {len(analysis_results[job_id]['failed_urls'])}")
+            
             channel_queue.task_done()
 
 async def controversy_screening_worker(worker_id: int, controversy_queue: asyncio.Queue, video_queue: asyncio.Queue,
@@ -247,7 +253,8 @@ async def controversy_screening_worker(worker_id: int, controversy_queue: asynci
             is_controversial, controversy_reason, controversy_status = await screen_creator_for_controversy(
                 channel_name or "Unknown", 
                 channel_handle or "Unknown",
-                llm_analyzer
+                llm_analyzer,
+                url  # Pass the channel URL for better screening
             )
             
             screening_time = time.time() - start_time
@@ -272,26 +279,58 @@ async def controversy_screening_worker(worker_id: int, controversy_queue: asynci
                 # Update pipeline stage: screening -> controversy check failed
                 update_pipeline_stage(job_id, 'screening_controversy', 'controversy_check_failed', analysis_results=analysis_results)
                 
-                # Still queue the videos for processing despite controversy
-                for video in videos:
-                    # Update pipeline stage: screening -> queued for transcripts
-                    update_pipeline_stage(job_id, 'screening_controversy', 'queued_for_transcripts', analysis_results=analysis_results)
-                    
-                    # Update video discovery count
-                    analysis_results[job_id]['video_progress']['total_videos_discovered'] += 1
-                    
-                    await video_queue.put({
-                        'url': url,
-                        'video_id': video['id'],
-                        'video_title': video['title'],
-                        'video_url': video['url'],
-                        'channel_id': channel_id,
-                        'channel_name': channel_name,
-                        'channel_handle': channel_handle,
-                        'start_time': time.time(),
-                        'controversy_check_failed': True,  # Flag that controversy check failed
-                        'controversy_status': controversy_status
-                    })
+                # FIXED: Add controversial channels to RESULTS with proper scoring, not failed_urls
+                # Create a proper analysis result structure for controversial channels
+                controversy_analysis = {
+                    "video_id": "controversy_screening",
+                    "video_title": "Controversy Screening Result",
+                    "video_url": url,
+                    "analysis": {
+                        "results": {
+                            "Controversy or Cancelled Creators": {
+                                "score": 1.0,  # High Risk score
+                                "evidence": [controversy_reason],
+                                "explanation": f"Channel flagged during controversy screening: {controversy_reason}"
+                            }
+                        }
+                    }
+                }
+                
+                # Create channel summary with controversy category marked
+                controversy_summary = {
+                    "Controversy or Cancelled Creators": {
+                        "max_score": 1.0,
+                        "average_score": 1.0,
+                        "videos_with_violations": 1,
+                        "total_videos": 1,
+                        "examples": [{
+                            "video_id": "controversy_screening",
+                            "video_title": "Controversy Screening Result",
+                            "video_url": url,
+                            "score": 1.0,
+                            "evidence": controversy_reason
+                        }]
+                    }
+                }
+                
+                # Add to results (not failed_urls) so it shows as FAIL with proper scoring
+                analysis_results[job_id]['results'][url] = {
+                    "url": str(url),
+                    "channel_id": channel_id,
+                    "channel_name": channel_name or "Unknown",
+                    "channel_handle": channel_handle or "Unknown",
+                    "video_analyses": [controversy_analysis],
+                    "summary": controversy_summary,
+                    "original_videos": [],
+                    "controversy_flagged": True,
+                    "controversy_status": controversy_status,
+                    "controversy_reason": controversy_reason,
+                    "status": "FAIL"  # Explicitly mark as FAIL
+                }
+                
+                logger.info(f"✅ Added controversial channel {url} to results as FAIL: {controversy_reason}")
+                
+                # Don't process videos for controversial channels
             else:
                 logger.debug(f"✅ Controversy Worker {worker_id}: {channel_name} passed controversy screening in {screening_time:.2f}s")
                 
@@ -369,10 +408,8 @@ async def controversy_screening_worker(worker_id: int, controversy_queue: asynci
             controversy_queue.task_done()
 
 async def video_transcript_worker(worker_id: int, video_queue: asyncio.Queue, llm_queue: asyncio.Queue,
-                                 youtube_analyzer, timing_stats: dict, job_id: str, analysis_results: dict):
-    """Worker that fetches individual video transcripts with global rate limiting"""
-    import random
-    
+                                 youtube_analyzer, timing_stats: dict, job_id: str, analysis_results: dict, result_queue: asyncio.Queue = None):
+    """Worker that fetches transcripts for individual videos"""
     while True:
         try:
             # Check if job is cancelled
@@ -380,23 +417,8 @@ async def video_transcript_worker(worker_id: int, video_queue: asyncio.Queue, ll
                 logger.info(f"🎬 Video Worker {worker_id}: Job {job_id} cancelled, stopping...")
                 break
             
-            # Check if we're in backoff period
-            async with youtube_rate_limiter['lock']:
-                if youtube_rate_limiter['blocked_until']:
-                    wait_time = youtube_rate_limiter['blocked_until'] - time.time()
-                    if wait_time > 0:
-                        # Add random jitter to prevent thundering herd
-                        jitter = random.uniform(0, min(10, wait_time * 0.1))
-                        logger.debug(f"🎬 Video Worker {worker_id}: In backoff period, waiting {wait_time + jitter:.1f}s")
-                        await asyncio.sleep(wait_time + jitter)
-                        continue
-                
-            # Get work item with timeout to prevent indefinite blocking
-            try:
-                item = await asyncio.wait_for(video_queue.get(), timeout=30.0)
-            except asyncio.TimeoutError:
-                logger.warning(f"🎬 Video Worker {worker_id}: Timeout waiting for work item, checking if job cancelled...")
-                continue
+            # Get work item
+            item = await video_queue.get()
             
             video_id = item['video_id']
             video_url = item['video_url']
@@ -412,55 +434,133 @@ async def video_transcript_worker(worker_id: int, video_queue: asyncio.Queue, ll
             
             logger.debug(f"🎬 Video Worker {worker_id}: Processing video {video_id}")
             
-            # CHECK CACHE FIRST
-            cached_result = video_cache.get_cached_result(video_url)
-            if cached_result:
-                logger.info(f"🎯 Cache hit for video {video_id}: {item['video_title']}")
-                
-                # Update cache hit counter
-                analysis_results[job_id]['video_progress']['cache_hits'] += 1
-                analysis_results[job_id]['video_progress']['videos_with_transcripts'] += 1
-                analysis_results[job_id]['video_progress']['videos_analyzed_by_llm'] += 1
-                analysis_results[job_id]['video_progress']['videos_completed'] += 1
-                
-                # Skip transcript and LLM processing - go directly to results
-                # Update pipeline stages to reflect cache hit
-                update_pipeline_stage(job_id, 'fetching_transcripts', 'completed', analysis_results=analysis_results)
-                
-                # Create result entry directly from cache
-                result_item = {
-                    'url': item['url'],  # Original channel URL
-                    'video_id': video_id,
-                    'video_title': item['video_title'],
-                    'video_url': video_url,
-                    'video_analysis': cached_result['llm_result'],
-                    'transcript': cached_result['transcript'],
-                    'channel_id': item['channel_id'],
-                    'channel_name': item['channel_name'],
-                    'channel_handle': item['channel_handle'],
-                    'start_time': time.time(),
-                    'controversy_check_failed': item.get('controversy_check_failed', False),
-                    'cache_hit': True
-                }
-                
-                # Get result queue from active job tasks
-                result_queue = None
-                if job_id in globals().get('active_job_tasks', {}):
-                    for task in globals()['active_job_tasks'][job_id]:
-                        if hasattr(task, 'get_queues'):
-                            queues = task.get_queues()
-                            if queues and 'result_queue' in queues:
-                                result_queue = queues['result_queue']
-                                break
-                
-                if result_queue:
-                    await result_queue.put(result_item)
-                    logger.debug(f"✅ Cache result queued for video {video_id}")
-                else:
-                    logger.warning(f"⚠️ Could not find result queue for cached video {video_id}")
-                
-                video_queue.task_done()
-                continue
+            # CHECK CACHE BASED ON ENVIRONMENT SETTINGS
+            if video_cache.cache_transcripts_only:
+                # TRANSCRIPT-ONLY CACHE MODE: Check for cached transcript only
+                cached_transcript = video_cache.get_cached_transcript(video_url)
+                if cached_transcript:
+                    logger.info(f"🎯 Transcript cache hit for video {video_id}: {item['video_title']}")
+                    
+                    # Update cache hit counter (but not full cache hit since we still need LLM processing)
+                    analysis_results[job_id]['video_progress']['cache_hits'] += 1
+                    analysis_results[job_id]['video_progress']['videos_with_transcripts'] += 1
+                    
+                    # Update pipeline stage: fetching transcripts -> queued for LLM
+                    update_pipeline_stage(job_id, 'fetching_transcripts', 'queued_for_llm', analysis_results=analysis_results)
+                    
+                    # Pass cached transcript to LLM queue for normal processing
+                    await llm_queue.put({
+                        'url': item['url'],  # Original channel URL
+                        'video_id': video_id,
+                        'video_title': item['video_title'],
+                        'video_url': item['video_url'],
+                        'transcript': cached_transcript['transcript'],
+                        'channel_id': item['channel_id'],
+                        'channel_name': item['channel_name'],
+                        'channel_handle': item['channel_handle'],
+                        'start_time': time.time(),
+                        'controversy_check_failed': item.get('controversy_check_failed', False),
+                        'transcript_cache_hit': True  # Flag to indicate transcript came from cache
+                    })
+                    
+                    video_queue.task_done()
+                    continue
+            elif not video_cache.cache_disabled:
+                # FULL CACHE MODE: Check for full cached result (transcript + LLM)
+                cached_result = video_cache.get_cached_result(video_url)
+                if cached_result:
+                    logger.info(f"🎯 Full cache hit for video {video_id}: {item['video_title']}")
+                    
+                    # Update cache hit counter
+                    analysis_results[job_id]['video_progress']['cache_hits'] += 1
+                    analysis_results[job_id]['video_progress']['videos_with_transcripts'] += 1
+                    analysis_results[job_id]['video_progress']['videos_analyzed_by_llm'] += 1
+                    
+                    # Create result entry directly from cache
+                    result_item = {
+                        'url': item['url'],  # Original channel URL
+                        'video_id': video_id,
+                        'video_title': item['video_title'],
+                        'video_url': video_url,
+                        'video_analysis': cached_result['llm_result'],
+                        'transcript': cached_result['transcript'],
+                        'channel_id': item['channel_id'],
+                        'channel_name': item['channel_name'],
+                        'channel_handle': item['channel_handle'],
+                        'start_time': time.time(),
+                        'controversy_check_failed': item.get('controversy_check_failed', False),
+                        'cache_hit': True
+                    }
+                    
+                    # Try to use the passed result_queue first, then fallback to queue lookup
+                    if result_queue:
+                        # Update pipeline stages to reflect cache hit processing
+                        update_pipeline_stage(job_id, 'fetching_transcripts', 'queued_for_llm', analysis_results=analysis_results)
+                        update_pipeline_stage(job_id, 'queued_for_llm', 'llm_processing', analysis_results=analysis_results)
+                        update_pipeline_stage(job_id, 'llm_processing', 'queued_for_results', analysis_results=analysis_results)
+                        
+                        await result_queue.put(result_item)
+                        logger.debug(f"✅ Cache result queued for video {video_id}")
+                    else:
+                        # Fallback: try to get from worker's get_queues method
+                        current_task = asyncio.current_task()
+                        if hasattr(current_task, 'get_queues'):
+                            try:
+                                queues = current_task.get_queues()
+                                if queues and 'result_queue' in queues:
+                                    result_queue = queues['result_queue']
+                                    
+                                    # Update pipeline stages to reflect cache hit processing
+                                    update_pipeline_stage(job_id, 'fetching_transcripts', 'queued_for_llm', analysis_results=analysis_results)
+                                    update_pipeline_stage(job_id, 'queued_for_llm', 'llm_processing', analysis_results=analysis_results)
+                                    update_pipeline_stage(job_id, 'llm_processing', 'queued_for_results', analysis_results=analysis_results)
+                                    
+                                    await result_queue.put(result_item)
+                                    logger.debug(f"✅ Cache result queued for video {video_id} (via get_queues)")
+                                else:
+                                    raise Exception("No result_queue in queues")
+                            except Exception as e:
+                                logger.error(f"❌ Could not find result queue for cached video {video_id} - using direct processing: {e}")
+                                
+                                # IMPROVED FALLBACK: Process the cache hit directly like the result worker would
+                                url = item['url']
+                                if url not in analysis_results[job_id]['results']:
+                                    analysis_results[job_id]['results'][url] = {
+                                        "url": str(url),
+                                        "channel_id": item['channel_id'],
+                                        "channel_name": item['channel_name'],
+                                        "channel_handle": item['channel_handle'],
+                                        "video_analyses": [],
+                                        "summary": {},
+                                        "original_videos": [],
+                                        "controversy_flagged": False,
+                                        "controversy_status": "not_controversial"
+                                    }
+                                
+                                # Add video analysis
+                                analysis_results[job_id]['results'][url]['video_analyses'].append({
+                                    "video_id": video_id,
+                                    "video_title": item['video_title'],
+                                    "video_url": video_url,
+                                    "analysis": cached_result['llm_result']
+                                })
+                                
+                                # Update video progress tracking (this was missing!)
+                                analysis_results[job_id]['video_progress']['videos_completed'] += 1
+                                
+                                # Update pipeline stages properly
+                                update_pipeline_stage(job_id, 'fetching_transcripts', 'queued_for_results', analysis_results=analysis_results)
+                                update_pipeline_stage(job_id, 'queued_for_results', 'result_processing', analysis_results=analysis_results)
+                                update_pipeline_stage(job_id, 'result_processing', 'completed', analysis_results=analysis_results)
+                                
+                                logger.debug(f"✅ Cache hit processed directly for video {video_id}")
+                        else:
+                            logger.error(f"❌ No get_queues method available for cached video {video_id}")
+                    
+                    video_queue.task_done()
+                    continue
+            # If cache is disabled or no cache hit, proceed with normal transcript fetching
+            logger.debug(f"🎬 Video Worker {worker_id}: {'Cache disabled, ' if video_cache.cache_disabled else ''}Fetching transcript for video {video_id}")
             
             # NO CACHE HIT - Proceed with normal transcript fetching
             logger.debug(f"🎬 Video Worker {worker_id}: Fetching transcript for video {video_id}")
@@ -499,6 +599,9 @@ async def video_transcript_worker(worker_id: int, video_queue: asyncio.Queue, ll
                         # Update pipeline stage: fetching transcripts -> failed
                         update_pipeline_stage(job_id, 'fetching_transcripts', 'failed', analysis_results=analysis_results)
                         # Don't add to failed_urls since this is a video-level failure
+                        
+                        # CRITICAL: Mark the current task as done when giving up
+                        video_queue.task_done()
                     else:
                         # Put the item back in the queue for retry with incremented count
                         item['retry_count'] = retry_count + 1
@@ -508,9 +611,9 @@ async def video_transcript_worker(worker_id: int, video_queue: asyncio.Queue, ll
                         update_pipeline_stage(job_id, 'fetching_transcripts', 'queued_for_transcripts', analysis_results=analysis_results)
                         
                         logger.info(f"🔄 Video Worker {worker_id}: Retrying video {video_id} (attempt {retry_count + 1}/{max_retries})")
-                    
-                    # CRITICAL: Mark the current task as done before retrying
-                    video_queue.task_done()
+                        
+                        # CRITICAL: Mark the current task as done before retrying
+                        video_queue.task_done()
                 else:
                     # Success! Reset consecutive blocks
                     async with youtube_rate_limiter['lock']:
@@ -537,14 +640,17 @@ async def video_transcript_worker(worker_id: int, video_queue: asyncio.Queue, ll
                         'start_time': time.time(),
                         'controversy_check_failed': item.get('controversy_check_failed', False)  # Pass the flag
                     })
+                    
+                    # Mark task as done for successful transcript fetch
+                    video_queue.task_done()
             else:
                 # Hide verbose logging for common transcript failures
                 logger.debug(f"❌ Video Worker {worker_id}: No transcript available for video {video_id}")
                 # Update pipeline stage: fetching transcripts -> failed (for this video)
                 update_pipeline_stage(job_id, 'fetching_transcripts', 'failed', analysis_results=analysis_results)
                 # Don't count this as a failure since we got some videos from the channel
-            
-            video_queue.task_done()
+                
+                video_queue.task_done()
             
         except asyncio.CancelledError:
             break
@@ -679,6 +785,16 @@ async def result_worker(worker_id: int, result_queue: asyncio.Queue, timing_stat
                 if url in analysis_results[job_id].get('controversy_check_failures', {}):
                     controversy_info = analysis_results[job_id]['controversy_check_failures'][url]
                 
+                # CRITICAL FIX: Remove from failed_urls if it was prematurely added
+                # This prevents double-counting when a channel was marked as "missing" but then completes successfully
+                failed_urls = analysis_results[job_id]['failed_urls']
+                failed_urls_before = len(failed_urls)
+                analysis_results[job_id]['failed_urls'] = [f for f in failed_urls if f['url'] != url]
+                failed_urls_after = len(analysis_results[job_id]['failed_urls'])
+                
+                if failed_urls_after < failed_urls_before:
+                    logger.info(f"🔧 Removed {url} from failed_urls (was prematurely marked as failed) - preventing double-counting")
+                
                 analysis_results[job_id]['results'][url] = {
                     "url": str(url),
                     "channel_id": item.get('channel_id', "unknown"),
@@ -710,7 +826,8 @@ async def result_worker(worker_id: int, result_queue: asyncio.Queue, timing_stat
             update_pipeline_stage(job_id, 'queued_for_results', 'result_processing', analysis_results=analysis_results)
             
             # Store result in cache for future use (unless it's already a cache hit)
-            if not item.get('cache_hit', False):
+            if not item.get('cache_hit', False) and not video_cache.cache_disabled:
+                # Store in cache unless cache is completely disabled
                 cache_stored = video_cache.store_result(
                     video_url=video_url,
                     video_id=video_id,
@@ -721,9 +838,30 @@ async def result_worker(worker_id: int, result_queue: asyncio.Queue, timing_stat
                     llm_result=video_analysis
                 )
                 if cache_stored:
-                    logger.debug(f"💾 Stored video {video_id} in cache")
+                    cache_mode = "transcript-only" if video_cache.cache_transcripts_only else "full"
+                    logger.debug(f"💾 Stored video {video_id} in cache ({cache_mode} mode)")
                 else:
                     logger.warning(f"⚠️ Failed to store video {video_id} in cache")
+            elif item.get('transcript_cache_hit', False):
+                # This was a transcript cache hit, so we should store the LLM result to complete the cache entry
+                if not video_cache.cache_disabled:
+                    cache_stored = video_cache.store_result(
+                        video_url=video_url,
+                        video_id=video_id,
+                        video_title=video_title,
+                        channel_id=channel_id,
+                        channel_name=channel_name,
+                        transcript=transcript,
+                        llm_result=video_analysis
+                    )
+                    if cache_stored:
+                        logger.debug(f"💾 Updated cache entry for video {video_id} with LLM result")
+                    else:
+                        logger.warning(f"⚠️ Failed to update cache entry for video {video_id}")
+            elif video_cache.cache_disabled:
+                logger.debug(f"📦 Cache disabled - not storing video {video_id}")
+            else:
+                logger.debug(f"📦 Video {video_id} already from cache - not storing again")
             
             # Mark task as done
             result_queue.task_done()
@@ -956,7 +1094,7 @@ async def process_job_with_cleanup(job_id: str, urls: List[str], video_limit: in
         # Video transcript workers
         for i in range(5):  # 5 video transcript workers
             worker = asyncio.create_task(
-                video_transcript_worker(i, video_queue, llm_queue, youtube_analyzer, timing_stats, job_id, analysis_results)
+                video_transcript_worker(i, video_queue, llm_queue, youtube_analyzer, timing_stats, job_id, analysis_results, result_queue)
             )
             worker.get_queues = lambda: queues
             worker.clear_queues = lambda: clear_queues(queues)

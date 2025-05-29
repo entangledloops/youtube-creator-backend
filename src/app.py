@@ -26,8 +26,9 @@ from src.llm_analyzer import LLMAnalyzer
 from src.version import __version__, __build_date__, VERSION_HISTORY
 from src.rate_limiter import youtube_rate_limiter
 from src.controversy_screener import screen_creator_for_controversy
+from src import job_manager
 from src.job_manager import (
-    job_queue, current_job_id, job_queue_lock, active_job_tasks,
+    job_queue, job_queue_lock, active_job_tasks,
     process_job_with_cleanup, update_queue_wait_times
 )
 from src.export_handlers import (
@@ -258,7 +259,8 @@ async def analyze_creator(request: CreatorAnalysisRequest):
         is_controversial, controversy_reason, controversy_status = await screen_creator_for_controversy(
             channel_name or "Unknown", 
             channel_handle or "Unknown",
-            llm_analyzer
+            llm_analyzer,
+            creator_url  # Pass the channel URL for better screening
         )
         
         if is_controversial:
@@ -467,11 +469,16 @@ async def bulk_analyze(
         
         # Handle job queuing
         async with job_queue_lock:
-            global current_job_id
+            global job_queue  # Must declare global before using it
             
-            if current_job_id is None:
+            # DEBUG: Log current queue state
+            logger.info(f"🔍 QUEUE DEBUG: current_job_id = {job_manager.current_job_id}")
+            logger.info(f"🔍 QUEUE DEBUG: job_queue length = {len(job_queue)}")
+            logger.info(f"🔍 QUEUE DEBUG: active_job_tasks keys = {list(active_job_tasks.keys())}")
+            
+            if job_manager.current_job_id is None:
                 # No job running, start immediately
-                current_job_id = job_id
+                job_manager.current_job_id = job_id
                 analysis_results[job_id]['status'] = 'processing'
                 analysis_results[job_id]['queue_position'] = 0
                 
@@ -499,8 +506,8 @@ async def bulk_analyze(
                     analysis_results[queued_job_id]['queue_position'] = i + 1
                     
                     # Estimate wait time based on current job progress
-                    if current_job_id and current_job_id in analysis_results:
-                        current_job = analysis_results[current_job_id]
+                    if job_manager.current_job_id and job_manager.current_job_id in analysis_results:
+                        current_job = analysis_results[job_manager.current_job_id]
                         current_progress = current_job['processed_urls'] / current_job['total_urls'] if current_job['total_urls'] > 0 else 0
                         current_remaining_urls = current_job['total_urls'] - current_job['processed_urls']
                         
@@ -816,11 +823,15 @@ async def cancel_bulk_analysis(job_id: str):
     logger.info(f"🛑 CANCELLATION REQUEST for job {job_id} (status: {job['status']})")
     
     async with job_queue_lock:
-        global current_job_id
+        global job_queue  # Must declare global before using it
+        
+        # DEBUG: Log current queue state
+        logger.info(f"🔍 QUEUE DEBUG: current_job_id = {job_manager.current_job_id}")
+        logger.info(f"🔍 QUEUE DEBUG: job_queue length = {len(job_queue)}")
+        logger.info(f"🔍 QUEUE DEBUG: active_job_tasks keys = {list(active_job_tasks.keys())}")
         
         if job['status'] == 'queued':
             # Remove from queue
-            global job_queue
             job_queue = [j for j in job_queue if j['job_id'] != job_id]
             
             # Update queue positions for remaining jobs
@@ -834,7 +845,7 @@ async def cancel_bulk_analysis(job_id: str):
             
             logger.info(f"✅ Cancelled queued job {job_id}")
             
-        elif job['status'] == 'processing' and current_job_id == job_id:
+        elif job['status'] == 'processing' and job_manager.current_job_id == job_id:
             # Cancel active job
             analysis_results[job_id]['status'] = 'cancelling'
             
@@ -892,22 +903,22 @@ async def cancel_bulk_analysis(job_id: str):
             analysis_results[job_id]['completed_at'] = datetime.now().isoformat()
             
             # Reset current job and start next in queue
-            current_job_id = None
+            job_manager.current_job_id = None
             
             # Start next job if any are queued
             if job_queue:
                 next_job = job_queue.pop(0)
-                current_job_id = next_job['job_id']
+                job_manager.current_job_id = next_job['job_id']
                 
                 # Update status and start processing
-                analysis_results[current_job_id]['status'] = 'processing'
-                analysis_results[current_job_id]['queue_position'] = 0
+                analysis_results[job_manager.current_job_id]['status'] = 'processing'
+                analysis_results[job_manager.current_job_id]['queue_position'] = 0
                 
-                logger.info(f"🚀 Starting next queued job {current_job_id}")
+                logger.info(f"🚀 Starting next queued job {job_manager.current_job_id}")
                 
                 task = asyncio.create_task(
                     process_job_with_cleanup(
-                        current_job_id,
+                        job_manager.current_job_id,
                         next_job['urls'],
                         next_job['video_limit'],
                         next_job['llm_provider'],
@@ -916,7 +927,7 @@ async def cancel_bulk_analysis(job_id: str):
                 )
                 
                 # Track task for cancellation
-                active_job_tasks[current_job_id] = [task]
+                active_job_tasks[job_manager.current_job_id] = [task]
             
             logger.info(f"✅ Cancelled active job {job_id}")
     
@@ -976,4 +987,100 @@ async def download_evidence(job_id: str):
 @app.get("/api/bulk-analyze/{job_id}/failed-csv")
 async def download_failed_csv(job_id: str):
     """Download failed URLs from bulk analysis as CSV"""
-    return await download_failed_urls_csv(job_id, analysis_results) 
+    return await download_failed_urls_csv(job_id, analysis_results)
+
+@app.delete("/api/bulk-analyze/cancel-all")
+async def cancel_all_jobs():
+    """Cancel all ongoing jobs and clear the job queue"""
+    logger.info("🔴 CANCEL-ALL ENDPOINT: Request received")
+    try:
+        cancelled_jobs = []
+        
+        async with job_queue_lock:
+            global job_queue
+            
+            # Cancel the currently running job if any
+            if job_manager.current_job_id and job_manager.current_job_id in analysis_results:
+                current_job = analysis_results[job_manager.current_job_id]
+                if current_job['status'] in ['processing', 'queued']:
+                    logger.info(f"🛑 CANCEL ALL: Cancelling active job {job_manager.current_job_id}")
+                    
+                    # Mark as cancelled
+                    analysis_results[job_manager.current_job_id]['status'] = 'cancelled'
+                    analysis_results[job_manager.current_job_id]['completed_at'] = datetime.now().isoformat()
+                    
+                    # Cancel all active tasks for this job
+                    if job_manager.current_job_id in active_job_tasks:
+                        logger.info(f"🛑 Cancelling {len(active_job_tasks[job_manager.current_job_id])} active tasks for job {job_manager.current_job_id}")
+                        
+                        # First, clear all queues to prevent new work from being picked up
+                        for task in active_job_tasks[job_manager.current_job_id]:
+                            if hasattr(task, 'clear_queues'):
+                                await task.clear_queues()
+                        
+                        # Then cancel the tasks
+                        for task in active_job_tasks[job_manager.current_job_id]:
+                            if not task.done():
+                                task.cancel()
+                        
+                        # Wait for tasks to finish cancelling with a timeout
+                        try:
+                            await asyncio.wait_for(
+                                asyncio.gather(*active_job_tasks[job_manager.current_job_id], return_exceptions=True),
+                                timeout=3.0  # 3 second timeout for cancel-all
+                            )
+                        except asyncio.TimeoutError:
+                            logger.warning(f"Timeout waiting for tasks to cancel for job {job_manager.current_job_id}")
+                        except Exception as e:
+                            logger.warning(f"Error during task cancellation for job {job_manager.current_job_id}: {str(e)}")
+                        
+                        # Clean up task tracking
+                        del active_job_tasks[job_manager.current_job_id]
+                    
+                    cancelled_jobs.append({
+                        'job_id': job_manager.current_job_id,
+                        'status': 'was_processing',
+                        'partial_results': len(current_job['results']),
+                        'failed_urls': len(current_job['failed_urls'])
+                    })
+            
+            # Cancel all queued jobs
+            queued_jobs_cancelled = []
+            for queued_job in job_queue:
+                queued_job_id = queued_job['job_id']
+                if queued_job_id in analysis_results:
+                    logger.info(f"🛑 CANCEL ALL: Cancelling queued job {queued_job_id}")
+                    
+                    # Mark as cancelled
+                    analysis_results[queued_job_id]['status'] = 'cancelled'
+                    analysis_results[queued_job_id]['completed_at'] = datetime.now().isoformat()
+                    
+                    queued_jobs_cancelled.append({
+                        'job_id': queued_job_id,
+                        'status': 'was_queued',
+                        'queue_position': analysis_results[queued_job_id].get('queue_position', 0)
+                    })
+            
+            cancelled_jobs.extend(queued_jobs_cancelled)
+            
+            # Clear the job queue and reset current job
+            job_queue.clear()
+            job_manager.current_job_id = None
+            
+            logger.info(f"✅ CANCEL ALL: Cancelled {len(cancelled_jobs)} jobs total")
+        
+        return {
+            "message": f"Successfully cancelled {len(cancelled_jobs)} jobs",
+            "cancelled_jobs": cancelled_jobs,
+            "summary": {
+                "total_cancelled": len(cancelled_jobs),
+                "active_jobs_cancelled": len([j for j in cancelled_jobs if j['status'] == 'was_processing']),
+                "queued_jobs_cancelled": len([j for j in cancelled_jobs if j['status'] == 'was_queued']),
+                "queue_cleared": True
+            },
+            "timestamp": datetime.now().isoformat()
+        }
+        
+    except Exception as e:
+        logger.error(f"Error cancelling all jobs: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e)) 

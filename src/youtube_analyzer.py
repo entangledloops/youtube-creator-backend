@@ -34,85 +34,118 @@ class YouTubeAnalyzer:
         logger.info(f"   └─ Delay between transcript requests: {self.request_delay_seconds}s")
         
     def extract_channel_info_from_url(self, url):
-        """Extract channel ID, name, and handle from a YouTube URL"""
+        """Extract channel ID, name, and handle from various YouTube URL formats"""
         try:
-            # Parse URL
-            parsed_url = urlparse(url)
-            channel_id = None
-            channel_name = None
-            channel_handle = None
+            logger.debug(f"🔍 Extracting channel info from URL: {url}")
             
-            # Channel URL pattern: youtube.com/channel/UC...
-            if 'youtube.com/channel/' in url:
-                channel_id = parsed_url.path.split('/channel/')[1].split('/')[0]
-                # Always try to get channel info from the page
-                response = requests.get(url)
-                soup = BeautifulSoup(response.text, 'html.parser')
+            # Direct channel ID URL
+            if '/channel/' in url:
+                channel_id = url.split('/channel/')[1].split('/')[0].split('?')[0]
+                logger.debug(f"📋 Found direct channel ID: {channel_id}")
                 
-                # Get channel name from page title
-                title_tag = soup.find('title')
-                if title_tag:
-                    channel_name = title_tag.text.replace(' - YouTube', '').strip()
+                # Try to get additional info from API if available
+                if self.youtube_api_key:
+                    logger.debug(f"🔑 Attempting to get channel info from API for {channel_id}")
+                    api_info = self._get_channel_info_from_api(channel_id)
+                    if api_info:
+                        return channel_id, api_info.get('title'), api_info.get('customUrl')
+                    else:
+                        logger.debug(f"⚠️ API call failed or returned no data for {channel_id}")
+                else:
+                    logger.debug(f"🚫 No API key available for channel info lookup")
                 
-                # Try to get channel handle from the page
-                for link in soup.find_all('link'):
-                    if link.get('rel') == ['canonical']:
-                        canonical_url = link.get('href', '')
-                        if '/@' in canonical_url:
-                            channel_handle = '@' + canonical_url.split('/@')[1].split('/')[0]
-                            break
-                
-                # If we have API key, also try to get info from API
-                if self.youtube_api_key and not channel_name:
-                    channel_info = self._get_channel_info_from_api(channel_id)
-                    if channel_info:
-                        channel_name = channel_info.get('title')
-                        if not channel_handle:
-                            channel_handle = channel_info.get('customUrl')
+                # API failed or not available - try scraping the channel page for name
+                logger.debug(f"🕷️ API failed, attempting to scrape channel name from page")
+                scraped_name = self._scrape_channel_name_from_page(f"https://www.youtube.com/channel/{channel_id}")
+                return channel_id, scraped_name, None
             
-            # User URL pattern: youtube.com/user/username or youtube.com/@handle
-            elif 'youtube.com/user/' in url or 'youtube.com/c/' in url or 'youtube.com/@' in url:
-                # Extract handle from URL
-                if 'youtube.com/@' in url:
-                    channel_handle = '@' + parsed_url.path.split('/@')[1].split('/')[0]
-                elif 'youtube.com/c/' in url:
-                    channel_handle = '@' + parsed_url.path.split('/c/')[1].split('/')[0]
-                elif 'youtube.com/user/' in url:
-                    channel_handle = '@' + parsed_url.path.split('/user/')[1].split('/')[0]
+            # Handle @username format
+            elif '/@' in url:
+                handle = url.split('/@')[1].split('/')[0].split('?')[0]
+                logger.debug(f"📋 Found handle: @{handle}")
                 
-                # Need to fetch the page and extract channel ID
-                response = requests.get(url)
-                soup = BeautifulSoup(response.text, 'html.parser')
+                # Try to resolve handle to channel ID by scraping the handle page
+                logger.debug(f"🔍 Attempting to resolve handle @{handle} to channel ID")
+                channel_id = self._resolve_handle_to_channel_id(handle)
                 
-                # Look for channel ID in meta tags or other elements
-                for link in soup.find_all('link'):
-                    if 'channel_id' in link.get('href', ''):
-                        channel_id = link.get('href').split('channel_id=')[1]
-                        break
-                
-                # Get channel name from page title
-                title_tag = soup.find('title')
-                if title_tag:
-                    channel_name = title_tag.text.replace(' - YouTube', '')
-            
-            # For video URLs, get channel from the video page
-            elif 'youtube.com/watch' in url:
-                video_id = parse_qs(parsed_url.query).get('v', [None])[0]
-                if video_id:
-                    channel_info = self.get_channel_info_from_video(video_id)
-                    if channel_info:
-                        channel_id = channel_info.get('channel_id')
-                        channel_name = channel_info.get('channel_name')
-                        channel_handle = channel_info.get('channel_handle')
+                if channel_id:
+                    logger.debug(f"✅ Successfully resolved @{handle} to channel ID: {channel_id}")
                     
-            if not channel_id:
-                logger.warning(f"Couldn't extract channel ID from URL: {url}")
+                    # Try to get additional info from API if available
+                    if self.youtube_api_key:
+                        api_info = self._get_channel_info_from_api(channel_id)
+                        if api_info:
+                            return channel_id, api_info.get('title'), f"@{handle}"
+                    
+                    # API failed or not available - try scraping for name
+                    scraped_name = self._scrape_channel_name_from_page(f"https://www.youtube.com/@{handle}")
+                    return channel_id, scraped_name or handle, f"@{handle}"
+                else:
+                    logger.warning(f"⚠️ Failed to resolve handle @{handle} to channel ID")
+                    # Even if we can't get channel ID, try to scrape name from handle page
+                    scraped_name = self._scrape_channel_name_from_page(f"https://www.youtube.com/@{handle}")
+                    return None, scraped_name or handle, f"@{handle}"
+            
+            # Handle /c/ custom URL format  
+            elif '/c/' in url:
+                custom_name = url.split('/c/')[1].split('/')[0].split('?')[0]
+                logger.debug(f"📋 Found custom channel name: {custom_name}")
+                
+                # Try to resolve custom name to channel ID by scraping
+                logger.debug(f"🔍 Attempting to resolve custom name {custom_name} to channel ID")
+                channel_id = self._resolve_custom_url_to_channel_id(custom_name, 'c')
+                
+                if channel_id:
+                    logger.debug(f"✅ Successfully resolved /c/{custom_name} to channel ID: {channel_id}")
+                    
+                    # Try to get additional info from API if available
+                    if self.youtube_api_key:
+                        api_info = self._get_channel_info_from_api(channel_id)
+                        if api_info:
+                            return channel_id, api_info.get('title'), None
+                    
+                    # API failed or not available - try scraping for name
+                    scraped_name = self._scrape_channel_name_from_page(f"https://www.youtube.com/c/{custom_name}")
+                    return channel_id, scraped_name or custom_name, None
+                else:
+                    logger.warning(f"⚠️ Failed to resolve custom name {custom_name} to channel ID")
+                    # Even if we can't get channel ID, try to scrape name
+                    scraped_name = self._scrape_channel_name_from_page(f"https://www.youtube.com/c/{custom_name}")
+                    return None, scraped_name or custom_name, None
+            
+            # Handle /user/ format (legacy)
+            elif '/user/' in url:
+                username = url.split('/user/')[1].split('/')[0].split('?')[0]
+                logger.debug(f"📋 Found legacy username: {username}")
+                
+                # Try to resolve username to channel ID by scraping
+                logger.debug(f"🔍 Attempting to resolve username {username} to channel ID")
+                channel_id = self._resolve_custom_url_to_channel_id(username, 'user')
+                
+                if channel_id:
+                    logger.debug(f"✅ Successfully resolved /user/{username} to channel ID: {channel_id}")
+                    
+                    # Try to get additional info from API if available
+                    if self.youtube_api_key:
+                        api_info = self._get_channel_info_from_api(channel_id)
+                        if api_info:
+                            return channel_id, api_info.get('title'), None
+                    
+                    # API failed or not available - try scraping for name
+                    scraped_name = self._scrape_channel_name_from_page(f"https://www.youtube.com/user/{username}")
+                    return channel_id, scraped_name or username, None
+                else:
+                    logger.warning(f"⚠️ Failed to resolve username {username} to channel ID")
+                    # Even if we can't get channel ID, try to scrape name
+                    scraped_name = self._scrape_channel_name_from_page(f"https://www.youtube.com/user/{username}")
+                    return None, scraped_name or username, None
+            
+            else:
+                logger.warning(f"⚠️ Unrecognized URL format: {url}")
                 return None, None, None
                 
-            return channel_id, channel_name, channel_handle
-            
         except Exception as e:
-            logger.error(f"Error extracting channel info: {str(e)}")
+            logger.error(f"💥 Error extracting channel info from {url}: {str(e)}")
             return None, None, None
     
     def _get_channel_info_from_api(self, channel_id):
@@ -121,10 +154,6 @@ class YouTubeAnalyzer:
             return None
             
         try:
-            # Track API call
-            youtube_rate_limiter['total_api_calls'] += 1
-            logger.debug(f"📊 Channel info API call #{youtube_rate_limiter['total_api_calls']} for channel {channel_id}")
-            
             url = "https://www.googleapis.com/youtube/v3/channels"
             params = {
                 "key": self.youtube_api_key,
@@ -132,8 +161,12 @@ class YouTubeAnalyzer:
                 "part": "snippet"
             }
             
-            logger.debug(f"🌐 Making YouTube channel info API request")
+            logger.debug(f"🌐 Making YouTube channel info API request for {channel_id}")
             response = requests.get(url, params=params)
+            
+            # Track API call only after we know the request was made
+            youtube_rate_limiter['total_api_calls'] += 1
+            logger.debug(f"📊 Channel info API call #{youtube_rate_limiter['total_api_calls']} for channel {channel_id}")
             
             if response.status_code != 200:
                 logger.error(f"❌ YouTube channel info API error: {response.status_code} - {response.text}")
@@ -159,6 +192,112 @@ class YouTubeAnalyzer:
                 
         except Exception as e:
             logger.error(f"💥 Exception in YouTube channel info API call: {str(e)}")
+            return None
+    
+    def _resolve_handle_to_channel_id(self, handle):
+        """Resolve a YouTube handle to channel ID by scraping the handle page"""
+        try:
+            url = f"https://www.youtube.com/@{handle}"
+            logger.debug(f"🌐 Scraping handle page: {url}")
+            
+            # Add headers to mimic a browser request
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            }
+            
+            response = requests.get(url, headers=headers)
+            response.raise_for_status()
+            
+            # Method 1: Look for channel ID in meta tags
+            soup = BeautifulSoup(response.text, 'html.parser')
+            for meta in soup.find_all('meta'):
+                if meta.get('itemprop') == 'channelId':
+                    channel_id = meta.get('content')
+                    if channel_id:
+                        logger.debug(f"✅ Found channel ID in meta tag: {channel_id}")
+                        return channel_id
+            
+            # Method 2: Look for channel ID in script tags
+            for script in soup.find_all('script'):
+                script_text = str(script)
+                if 'channelId' in script_text:
+                    # Try to find channelId in the script
+                    match = re.search(r'"channelId":"([^"]+)"', script_text)
+                    if match:
+                        channel_id = match.group(1)
+                        logger.debug(f"✅ Found channel ID in script: {channel_id}")
+                        return channel_id
+            
+            # Method 3: Look for canonical URL with channel ID
+            canonical_link = soup.find('link', {'rel': 'canonical'})
+            if canonical_link:
+                canonical_url = canonical_link.get('href', '')
+                if '/channel/' in canonical_url:
+                    channel_id = canonical_url.split('/channel/')[1].split('/')[0]
+                    logger.debug(f"✅ Found channel ID in canonical URL: {channel_id}")
+                    return channel_id
+            
+            logger.warning(f"⚠️ Could not find channel ID for handle @{handle}")
+            return None
+            
+        except requests.RequestException as e:
+            logger.error(f"❌ Error fetching handle page for @{handle}: {str(e)}")
+            return None
+        except Exception as e:
+            logger.error(f"💥 Error resolving handle @{handle}: {str(e)}")
+            return None
+    
+    def _resolve_custom_url_to_channel_id(self, name, prefix):
+        """Resolve a custom URL to channel ID by scraping the channel page"""
+        try:
+            url = f"https://www.youtube.com/{prefix}/{name}"
+            logger.debug(f"🌐 Scraping channel page: {url}")
+            
+            # Add headers to mimic a browser request
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            }
+            
+            response = requests.get(url, headers=headers)
+            response.raise_for_status()
+            
+            # Method 1: Look for channel ID in meta tags
+            soup = BeautifulSoup(response.text, 'html.parser')
+            for meta in soup.find_all('meta'):
+                if meta.get('itemprop') == 'channelId':
+                    channel_id = meta.get('content')
+                    if channel_id:
+                        logger.debug(f"✅ Found channel ID in meta tag: {channel_id}")
+                        return channel_id
+            
+            # Method 2: Look for channel ID in script tags
+            for script in soup.find_all('script'):
+                script_text = str(script)
+                if 'channelId' in script_text:
+                    # Try to find channelId in the script
+                    match = re.search(r'"channelId":"([^"]+)"', script_text)
+                    if match:
+                        channel_id = match.group(1)
+                        logger.debug(f"✅ Found channel ID in script: {channel_id}")
+                        return channel_id
+            
+            # Method 3: Look for canonical URL with channel ID
+            canonical_link = soup.find('link', {'rel': 'canonical'})
+            if canonical_link:
+                canonical_url = canonical_link.get('href', '')
+                if '/channel/' in canonical_url:
+                    channel_id = canonical_url.split('/channel/')[1].split('/')[0]
+                    logger.debug(f"✅ Found channel ID in canonical URL: {channel_id}")
+                    return channel_id
+            
+            logger.warning(f"⚠️ Could not find channel ID for {prefix}/{name}")
+            return None
+            
+        except requests.RequestException as e:
+            logger.error(f"❌ Error fetching channel page for {prefix}/{name}: {str(e)}")
+            return None
+        except Exception as e:
+            logger.error(f"💥 Error resolving {prefix}/{name}: {str(e)}")
             return None
     
     def get_channel_info_from_video(self, video_id):
@@ -306,29 +445,28 @@ class YouTubeAnalyzer:
                 logger.debug(f"🔑 YouTube API key available, attempting API call for channel {channel_id}")
                 videos = self._get_videos_from_api(channel_id, limit)
                 if videos:
-                    logger.info(f"Found {len(videos)} videos through API")
+                    logger.info(f"✅ Found {len(videos)} videos through API")
                     return videos
-                logger.warning("API returned no videos, falling back to scraping")
+                logger.warning(f"⚠️ API returned no videos for {channel_id}, falling back to scraping")
             else:
                 logger.debug(f"🚫 No YouTube API key available, using scraping for channel {channel_id}")
             
-            # Otherwise, or if API failed, scrape the channel page
+            # Fallback to scraping
+            logger.debug(f"🕷️ Falling back to scraping for channel {channel_id}")
             videos = self._get_videos_by_scraping(channel_id, limit)
-            if not videos:
-                logger.warning(f"No videos found for channel {channel_id} through any method")
+            if videos:
+                logger.info(f"✅ Found {len(videos)} videos through scraping")
+            else:
+                logger.warning(f"⚠️ No videos found through scraping for {channel_id}")
             return videos
             
         except Exception as e:
-            logger.error(f"Error getting videos from channel: {str(e)}")
+            logger.error(f"💥 Error getting videos from channel {channel_id}: {str(e)}")
             return []
             
     def _get_videos_from_api(self, channel_id, limit):
         """Get videos using YouTube API"""
         try:
-            # Track API call
-            youtube_rate_limiter['total_api_calls'] += 1
-            logger.debug(f"📊 API call #{youtube_rate_limiter['total_api_calls']} for channel {channel_id}")
-            
             url = f"https://www.googleapis.com/youtube/v3/search"
             params = {
                 "key": self.youtube_api_key,
@@ -341,6 +479,10 @@ class YouTubeAnalyzer:
             
             logger.debug(f"🌐 Making YouTube API request to: {url}")
             response = requests.get(url, params=params)
+            
+            # Track API call only after we know the request was made
+            youtube_rate_limiter['total_api_calls'] += 1
+            logger.debug(f"📊 API call #{youtube_rate_limiter['total_api_calls']} for channel {channel_id}")
             
             if response.status_code != 200:
                 logger.error(f"❌ YouTube API error: {response.status_code} - {response.text}")
@@ -556,4 +698,85 @@ class YouTubeAnalyzer:
     # Keep the synchronous version for backward compatibility
     def get_transcript(self, video_id: str) -> Optional[Dict[str, Any]]:
         """Synchronous version of get_transcript for backward compatibility"""
-        return asyncio.run(self.get_transcript_async(video_id)) 
+        return asyncio.run(self.get_transcript_async(video_id))
+
+    def _scrape_channel_name_from_page(self, url):
+        """Scrape channel name from a YouTube channel page"""
+        try:
+            logger.debug(f"🕷️ Scraping channel name from: {url}")
+            
+            # Add headers to mimic a browser request
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            }
+            
+            response = requests.get(url, headers=headers)
+            response.raise_for_status()
+            
+            soup = BeautifulSoup(response.text, 'html.parser')
+            
+            # Method 1: Look for channel name in meta tags
+            for meta in soup.find_all('meta'):
+                if meta.get('property') == 'og:title':
+                    channel_name = meta.get('content')
+                    if channel_name:
+                        logger.debug(f"✅ Found channel name in og:title meta: {channel_name}")
+                        return channel_name
+            
+            # Method 2: Look for channel name in title tag
+            title_tag = soup.find('title')
+            if title_tag:
+                title_text = title_tag.text.strip()
+                # YouTube channel titles are usually "Channel Name - YouTube"
+                if ' - YouTube' in title_text:
+                    channel_name = title_text.replace(' - YouTube', '').strip()
+                    logger.debug(f"✅ Found channel name in title tag: {channel_name}")
+                    return channel_name
+            
+            # Method 3: Look for channel name in script tags (JSON-LD)
+            for script in soup.find_all('script', type='application/ld+json'):
+                try:
+                    import json
+                    data = json.loads(script.string)
+                    if isinstance(data, list):
+                        for item in data:
+                            if item.get('@type') == 'Person' and item.get('name'):
+                                channel_name = item.get('name')
+                                logger.debug(f"✅ Found channel name in JSON-LD: {channel_name}")
+                                return channel_name
+                    elif data.get('@type') == 'Person' and data.get('name'):
+                        channel_name = data.get('name')
+                        logger.debug(f"✅ Found channel name in JSON-LD: {channel_name}")
+                        return channel_name
+                except (json.JSONDecodeError, AttributeError):
+                    continue
+            
+            # Method 4: Look for channel name in page content
+            # Try to find the channel name in various elements
+            for selector in [
+                'meta[name="title"]',
+                'h1.ytd-channel-name',
+                '.channel-header-profile-image-container + .branded-page-header-title-link',
+                '#channel-title',
+                '.ytd-c4-tabbed-header-renderer h1'
+            ]:
+                element = soup.select_one(selector)
+                if element:
+                    if element.name == 'meta':
+                        channel_name = element.get('content')
+                    else:
+                        channel_name = element.get_text(strip=True)
+                    
+                    if channel_name:
+                        logger.debug(f"✅ Found channel name with selector {selector}: {channel_name}")
+                        return channel_name
+            
+            logger.warning(f"⚠️ Could not find channel name in page: {url}")
+            return None
+            
+        except requests.RequestException as e:
+            logger.error(f"❌ Error fetching channel page {url}: {str(e)}")
+            return None
+        except Exception as e:
+            logger.error(f"💥 Error scraping channel name from {url}: {str(e)}")
+            return None 

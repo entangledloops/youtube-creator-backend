@@ -46,13 +46,42 @@ async def download_bulk_analysis_csv(job_id: str, analysis_results: dict):
         # Initialize all categories with 0.0
         for category in all_categories:
             row[category] = 0.0
+        
+        # Try to get scores from summary first (for completed jobs)
+        summary = result.get('summary', {})
+        if summary:
+            # Use existing summary data
+            for category, data in summary.items():
+                if category in all_categories:  # Only include valid categories
+                    score = round(data.get('average_score', 0), 2)
+                    row[category] = score
+                    row['overall_score'] = max(row['overall_score'], score)
+        else:
+            # No summary available (likely cancelled job) - calculate from video analyses
+            logger.info(f"📊 No summary found for {url}, calculating scores from video analyses")
             
-        # Add category scores from results
-        for category, data in result.get('summary', {}).items():
-            if category in all_categories:  # Only include valid categories
-                score = round(data.get('average_score', 0), 2)
-                row[category] = score
-                row['overall_score'] = max(row['overall_score'], score)
+            # Initialize category score collections
+            category_scores = {}
+            for category in all_categories:
+                category_scores[category] = []
+            
+            # Collect scores from all video analyses
+            for video_analysis in result.get('video_analyses', []):
+                analysis = video_analysis.get('analysis', {})
+                for category, violation_data in analysis.get('results', {}).items():
+                    if category in category_scores:
+                        score = violation_data.get('score', 0)
+                        if score > 0:
+                            category_scores[category].append(score)
+            
+            # Calculate average scores for each category
+            for category in all_categories:
+                if category_scores[category]:
+                    avg_score = sum(category_scores[category]) / len(category_scores[category])
+                    row[category] = round(avg_score, 2)
+                    row['overall_score'] = max(row['overall_score'], avg_score)
+                else:
+                    row[category] = 0.0
             
         # Round overall score
         row['overall_score'] = round(row['overall_score'], 2)

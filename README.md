@@ -81,6 +81,9 @@ youtube-creator-backend/
 
    # YouTube API (optional, for enhanced functionality)
    YOUTUBE_API_KEY=your_youtube_api_key_here
+
+   # Disable Video Cache
+   DISABLE_VIDEO_CACHE=false
    ```
 
 ## Usage
@@ -351,6 +354,7 @@ LLM_PROVIDER=openai                # Default provider
 OPENAI_MODEL=gpt-4o-mini           # OpenAI model to use
 LLM_CONTEXT_SIZE=128000           # Maximum context window size
 YOUTUBE_API_KEY=...                # Optional, enhances functionality
+DISABLE_VIDEO_CACHE=false          # Set to "true" to disable caching (testing)
 ```
 
 ## Contributing

@@ -16,6 +16,18 @@ class VideoCache:
         self.db_path = db_path
         self.cache_expiry_days = 30
         
+        # Check cache configuration via environment variables
+        self.cache_disabled = os.getenv("DISABLE_VIDEO_CACHE", "false").lower() in ("true", "1", "yes")
+        self.cache_transcripts_only = os.getenv("CACHE_TRANSCRIPTS_ONLY", "false").lower() in ("true", "1", "yes")
+        
+        if self.cache_disabled:
+            logger.info("📦 Video cache is DISABLED via DISABLE_VIDEO_CACHE environment variable")
+            return
+        elif self.cache_transcripts_only:
+            logger.info("📦 Video cache is in TRANSCRIPT-ONLY mode via CACHE_TRANSCRIPTS_ONLY environment variable")
+        else:
+            logger.info("📦 Video cache is ENABLED for full caching (transcripts + LLM results)")
+        
         # Ensure data directory exists
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
         
@@ -106,6 +118,10 @@ class VideoCache:
         Returns:
             Dict with 'transcript' and 'llm_result' keys if found, None otherwise
         """
+        # Return None immediately if cache is disabled
+        if self.cache_disabled:
+            return None
+            
         try:
             url_hash = self._get_url_hash(video_url)
             
@@ -159,6 +175,68 @@ class VideoCache:
             logger.error(f"Error retrieving cached result for {video_url}: {str(e)}")
             return None
     
+    def get_cached_transcript(self, video_url: str) -> Optional[Dict[str, Any]]:
+        """
+        Retrieve only cached transcript for a video URL (for CACHE_TRANSCRIPTS_ONLY mode)
+        
+        Returns:
+            Dict with 'transcript' key if found, None otherwise
+        """
+        # Return None immediately if cache is disabled
+        if self.cache_disabled:
+            return None
+            
+        try:
+            url_hash = self._get_url_hash(video_url)
+            
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                
+                # Check if entry exists and is not expired
+                expiry_date = datetime.now() - timedelta(days=self.cache_expiry_days)
+                
+                cursor.execute('''
+                    SELECT video_id, video_title, channel_id, channel_name, 
+                           transcript_json, created_at
+                    FROM video_cache 
+                    WHERE url_hash = ? AND created_at > ?
+                ''', (url_hash, expiry_date.isoformat()))
+                
+                result = cursor.fetchone()
+                
+                if result:
+                    # Update last_accessed timestamp
+                    cursor.execute('''
+                        UPDATE video_cache 
+                        SET last_accessed = CURRENT_TIMESTAMP 
+                        WHERE url_hash = ?
+                    ''', (url_hash,))
+                    conn.commit()
+                    
+                    video_id, video_title, channel_id, channel_name, transcript_json, created_at = result
+                    
+                    # Parse JSON data
+                    transcript = json.loads(transcript_json)
+                    
+                    logger.debug(f"✅ Transcript cache hit for video {video_id}: {video_title}")
+                    
+                    return {
+                        'video_id': video_id,
+                        'video_title': video_title,
+                        'video_url': video_url,
+                        'channel_id': channel_id,
+                        'channel_name': channel_name,
+                        'transcript': transcript,
+                        'cached_at': created_at,
+                        'transcript_cache_hit': True
+                    }
+                
+                return None
+                
+        except Exception as e:
+            logger.error(f"Error retrieving cached transcript for {video_url}: {str(e)}")
+            return None
+    
     def store_result(self, video_url: str, video_id: str, video_title: str, 
                     channel_id: str, channel_name: str, transcript: Dict[str, Any], 
                     llm_result: Dict[str, Any]) -> bool:
@@ -168,6 +246,10 @@ class VideoCache:
         Returns:
             True if stored successfully, False otherwise
         """
+        # Return True immediately if cache is disabled (no-op)
+        if self.cache_disabled:
+            return True
+            
         try:
             url_hash = self._get_url_hash(video_url)
             
@@ -198,6 +280,18 @@ class VideoCache:
     
     def get_cache_stats(self) -> Dict[str, Any]:
         """Get cache statistics"""
+        # Return disabled stats if cache is disabled
+        if self.cache_disabled:
+            return {
+                'total_entries': 0,
+                'recent_entries_24h': 0,
+                'oldest_entry': None,
+                'cache_expiry_days': self.cache_expiry_days,
+                'cache_disabled': True,
+                'cache_transcripts_only': False,
+                'status': 'disabled'
+            }
+            
         try:
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
@@ -224,7 +318,10 @@ class VideoCache:
                     'total_entries': total_entries,
                     'recent_entries_24h': recent_entries,
                     'oldest_entry': oldest_entry,
-                    'cache_expiry_days': self.cache_expiry_days
+                    'cache_expiry_days': self.cache_expiry_days,
+                    'cache_disabled': False,
+                    'cache_transcripts_only': self.cache_transcripts_only,
+                    'status': 'transcript_only' if self.cache_transcripts_only else 'full_cache'
                 }
                 
         except Exception as e:
@@ -233,7 +330,9 @@ class VideoCache:
                 'total_entries': 0,
                 'recent_entries_24h': 0,
                 'oldest_entry': None,
-                'cache_expiry_days': self.cache_expiry_days
+                'cache_expiry_days': self.cache_expiry_days,
+                'cache_disabled': False,
+                'cache_transcripts_only': self.cache_transcripts_only
             }
     
     def clear_cache(self) -> bool:
