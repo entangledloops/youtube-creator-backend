@@ -2,12 +2,23 @@
 Version information for YouTube Content Compliance Analyzer
 """
 
-__version__ = "1.2.6"
-__version_info__ = (1, 2, 6)
+__version__ = "1.2.7"
+__version_info__ = (1, 2, 7)
 __build_date__ = "2025-05-29"
 
 # Version history
 VERSION_HISTORY = {
+    "1.2.7": {
+        "date": "2025-05-29",
+        "changes": [
+            "PROPER FIX: Eliminated race condition in URL queuing without using sleep() calls",
+            "Completion monitor now waits for all URLs to be queued before checking for missing URLs",
+            "Fixed root cause where URLs were marked as 'missing' while still being added to the pipeline",
+            "Removed band-aid sleep() calls in favor of proper synchronization using url_task",
+            "URLs can no longer be incorrectly marked as 'pipeline tracking error' during startup",
+            "Ensures deterministic behavior - all URLs are in the pipeline before completion checking begins"
+        ]
+    },
     "1.2.6": {
         "date": "2025-05-29",
         "changes": [

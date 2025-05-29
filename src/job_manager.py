@@ -131,15 +131,6 @@ async def process_creators_pipeline(job_id: str, urls: List[str], video_limit: i
         monitor_task.clear_queues = make_clear_queues(queues)
         workers.append(monitor_task)
         
-        # Completion monitor task - this will handle job completion
-        completion_task = asyncio.create_task(
-            monitor_job_completion(job_id, urls, workers, queues, analysis_results)
-        )
-        workers.append(completion_task)
-        
-        # Store all workers for cancellation
-        active_job_tasks[job_id] = workers
-        
         # Create a task to add URLs to the queue asynchronously
         async def add_urls_to_queue():
             """Add URLs to channel queue asynchronously"""
@@ -167,6 +158,16 @@ async def process_creators_pipeline(job_id: str, urls: List[str], video_limit: i
         url_task = asyncio.create_task(add_urls_to_queue())
         workers.append(url_task)  # Add to workers list so it gets cancelled if job is cancelled
         
+        # Completion monitor task - this will handle job completion
+        # CRITICAL: Pass url_task so monitor can wait for all URLs to be queued
+        completion_task = asyncio.create_task(
+            monitor_job_completion(job_id, urls, workers, queues, analysis_results, url_task)
+        )
+        workers.append(completion_task)
+        
+        # Store all workers for cancellation
+        active_job_tasks[job_id] = workers
+        
         # DO NOT WAIT FOR WORKERS - Let them run in background
         logger.info(f"✅ Pipeline started for job {job_id} - workers running in background")
         
@@ -184,9 +185,15 @@ async def process_creators_pipeline(job_id: str, urls: List[str], video_limit: i
             del active_job_tasks[job_id]
 
 async def monitor_job_completion(job_id: str, urls: List[str], workers: List[asyncio.Task], 
-                               queues: dict, analysis_results: dict):
+                               queues: dict, analysis_results: dict, url_task: asyncio.Task):
     """Monitor job completion without blocking"""
     try:
+        # CRITICAL: Wait for all URLs to be queued before we start checking for completion
+        # This eliminates the race condition where URLs might be "missing" because they haven't been queued yet
+        logger.info(f"📋 Completion monitor waiting for all URLs to be queued...")
+        await url_task
+        logger.info(f"✅ All URLs queued, starting completion monitoring")
+        
         while True:
             await asyncio.sleep(2)  # Check every 2 seconds
             
@@ -239,21 +246,18 @@ async def monitor_job_completion(job_id: str, urls: List[str], workers: List[asy
                 if all_urls_processed and channels_still_processing > 0:
                     logger.warning(f"   └─ PIPELINE TRACKING ISSUE: All URLs processed but {channels_still_processing} channels still in processing stages")
                     logger.warning(f"   └─ This may indicate a race condition or tracking bug")
-                    
-                    # Wait a bit longer to see if the pipeline stages resolve
-                    await asyncio.sleep(5)
+                    # Continue without sleeping - the pipeline stages should resolve themselves
                     continue
                 
                 # Check for missing URLs only if we don't have all URLs processed
                 if not all_urls_processed:
-                    # CRITICAL FIX: Only check for missing URLs if NO channels are still processing
-                    # This prevents race conditions where we mark channels as missing while they're still in the pipeline
+                    # Since we waited for url_task, all URLs are definitely in the pipeline
+                    # But we should still check if channels are processing to avoid false positives
                     if channels_still_processing > 0:
-                        logger.info(f"📋 Skipping missing URL check - {channels_still_processing} channels still processing")
-                        # Wait longer and continue checking
-                        await asyncio.sleep(3)
+                        # Channels are still being processed, so "missing" URLs might just be in transit
                         continue
                     
+                    # If we still have missing URLs at this point with no channels processing, it's a real issue
                     processed_urls = set(analysis_results[job_id]['results'].keys()) | set(f['url'] for f in analysis_results[job_id]['failed_urls'])
                     missing_urls = set(urls) - processed_urls
                     if missing_urls:
