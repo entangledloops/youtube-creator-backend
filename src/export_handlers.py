@@ -10,6 +10,10 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+def get_output_directory() -> str:
+    """Get the output directory from environment variable with default fallback"""
+    return os.getenv("OUTPUT_DIR", "output")
+
 async def download_bulk_analysis_csv(job_id: str, analysis_results: dict):
     """Download bulk analysis results as CSV"""
     if job_id not in analysis_results:
@@ -131,13 +135,18 @@ async def download_bulk_analysis_csv(job_id: str, analysis_results: dict):
     column_order = ['url', 'channel_id', 'channel_name', 'channel_handle', 'status', 'overall_score'] + all_categories
     df = df[column_order]
     
+    # Create output directory if it doesn't exist
+    output_dir = get_output_directory()
+    os.makedirs(output_dir, exist_ok=True)
+    
     # Add metadata for cancelled jobs
     filename_suffix = "_partial" if job['status'] == 'cancelled' else ""
     filename = f"bulk_analysis_{job_id}{filename_suffix}.csv"
-    df.to_csv(filename, index=False)
+    filepath = os.path.join(output_dir, filename)
+    df.to_csv(filepath, index=False)
     
     return FileResponse(
-        filename,
+        filepath,
         media_type='text/csv',
         filename=filename
     )
@@ -205,15 +214,21 @@ async def download_bulk_analysis_evidence(job_id: str, analysis_results: dict):
     # Return as streaming JSON response
     json_str = json.dumps(evidence_data, indent=2, ensure_ascii=False)
     
-    def generate():
-        yield json_str
+    # Create output directory if it doesn't exist
+    output_dir = get_output_directory()
+    os.makedirs(output_dir, exist_ok=True)
     
-    return StreamingResponse(
-        generate(), 
+    # Save JSON to file in output directory
+    filename = f"evidence_{job_id}.json"
+    filepath = os.path.join(output_dir, filename)
+    
+    with open(filepath, 'w', encoding='utf-8') as f:
+        f.write(json_str)
+    
+    return FileResponse(
+        filepath,
         media_type='application/json',
-        headers={
-            "Content-Disposition": f"attachment; filename=evidence_{job_id}.json"
-        }
+        filename=filename
     )
 
 async def download_failed_urls_csv(job_id: str, analysis_results: dict):
@@ -247,13 +262,18 @@ async def download_failed_urls_csv(job_id: str, analysis_results: dict):
         
     df = pd.DataFrame(rows)
     
+    # Create output directory if it doesn't exist
+    output_dir = get_output_directory()
+    os.makedirs(output_dir, exist_ok=True)
+    
     # Add metadata for cancelled jobs
     filename_suffix = "_partial" if job['status'] == 'cancelled' else ""
     filename = f"failed_urls_{job_id}{filename_suffix}.csv"
-    df.to_csv(filename, index=False)
+    filepath = os.path.join(output_dir, filename)
+    df.to_csv(filepath, index=False)
     
     return FileResponse(
-        filename,
+        filepath,
         media_type='text/csv',
         filename=filename
     ) 
