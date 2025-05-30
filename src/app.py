@@ -20,6 +20,7 @@ import uuid
 from datetime import datetime, timedelta
 import json
 import time
+import re
 
 from src.youtube_analyzer import YouTubeAnalyzer
 from src.llm_analyzer import LLMAnalyzer
@@ -371,41 +372,132 @@ async def analyze_progress():
     
     return EventSourceResponse(event_generator())
 
+def is_youtube_url(url: str) -> bool:
+    """Check if a string is a valid YouTube URL"""
+    if not isinstance(url, str):
+        return False
+    
+    url = url.strip()
+    youtube_patterns = [
+        r'(?:https?://)?(?:www\.)?youtube\.com/',
+        r'(?:https?://)?(?:www\.)?youtu\.be/',
+        r'(?:https?://)?(?:m\.)?youtube\.com/',
+    ]
+    
+    return any(re.match(pattern, url, re.IGNORECASE) for pattern in youtube_patterns)
+
+def extract_youtube_urls_from_csv(file) -> List[str]:
+    """
+    Intelligently extract YouTube URLs from a CSV file.
+    Handles:
+    1. Files with or without headers
+    2. Multiple columns - finds the column with the most YouTube URLs
+    3. Mixed content - filters out non-URL entries
+    """
+    try:
+        # Reset file pointer to beginning
+        file.seek(0)
+        
+        # First, try to read with header detection
+        try:
+            # Sample first few rows to detect if there's a header
+            sample = pd.read_csv(file, nrows=5)
+            file.seek(0)
+            
+            # Check if first row looks like a header (non-URL strings)
+            first_row = sample.iloc[0] if len(sample) > 0 else pd.Series()
+            has_header = not any(is_youtube_url(str(val)) for val in first_row)
+            
+            # Read with appropriate header setting
+            if has_header:
+                df = pd.read_csv(file)
+                logger.info(f"📄 CSV detected with header: {list(df.columns)}")
+            else:
+                df = pd.read_csv(file, header=None)
+                logger.info(f"📄 CSV detected without header, {len(df.columns)} columns")
+                
+        except Exception as e:
+            # Fallback: try without header
+            file.seek(0)
+            df = pd.read_csv(file, header=None)
+            logger.info(f"📄 CSV fallback reading without header: {len(df.columns)} columns")
+        
+        # If only one column, use it directly
+        if len(df.columns) == 1:
+            urls = df.iloc[:, 0].tolist()
+            logger.info(f"📄 Using single column with {len(urls)} rows")
+        else:
+            # Multiple columns - find the one with the most YouTube URLs
+            logger.info(f"📄 Multiple columns detected ({len(df.columns)}), analyzing content...")
+            
+            best_column = None
+            max_youtube_count = 0
+            
+            for col_idx, column in enumerate(df.columns):
+                # Count YouTube URLs in this column
+                youtube_count = sum(1 for val in df[column] if is_youtube_url(str(val)))
+                logger.info(f"   📊 Column {col_idx} ('{column}'): {youtube_count} YouTube URLs")
+                
+                if youtube_count > max_youtube_count:
+                    max_youtube_count = youtube_count
+                    best_column = column
+            
+            if best_column is not None and max_youtube_count > 0:
+                urls = df[best_column].tolist()
+                logger.info(f"✅ Selected column '{best_column}' with {max_youtube_count} YouTube URLs")
+            else:
+                # No column has YouTube URLs, use first column as fallback
+                urls = df.iloc[:, 0].tolist()
+                logger.warning(f"⚠️ No columns contain YouTube URLs, using first column as fallback")
+        
+        # Clean and validate URLs
+        cleaned_urls = []
+        skipped_count = 0
+        
+        for url in urls:
+            url_str = str(url).strip()
+            
+            # Skip empty, NaN, or clearly non-URL values
+            if not url_str or url_str.lower() in ['nan', 'none', 'null', '']:
+                continue
+                
+            if is_youtube_url(url_str):
+                # Ensure URL has protocol
+                if not url_str.startswith(('http://', 'https://')):
+                    url_str = 'https://' + url_str
+                cleaned_urls.append(url_str)
+            else:
+                skipped_count += 1
+                logger.debug(f"Skipping non-YouTube URL: {url_str}")
+        
+        if skipped_count > 0:
+            logger.info(f"📊 Skipped {skipped_count} non-YouTube entries")
+        
+        logger.info(f"✅ Extracted {len(cleaned_urls)} valid YouTube URLs from CSV")
+        return cleaned_urls
+        
+    except Exception as e:
+        logger.error(f"❌ Error processing CSV file: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Error processing CSV file: {str(e)}")
+
 @app.post("/api/bulk-analyze")
 async def bulk_analyze(
     file: UploadFile = File(...),
     request: BulkAnalysisRequest = None
 ):
     """Bulk analyze multiple YouTube creators from a CSV file with job queuing.
-    The file can be a single column of URLs with or without a header.
+    The file can contain single or multiple columns. The system will intelligently
+    detect and use the column with the most YouTube URLs. Headers are optional.
     Jobs are processed sequentially to avoid resource conflicts.
     """
     try:
-        # Read CSV file with flexible header handling
-        try:
-            # First try with header
-            df = pd.read_csv(file.file)
-            # If we have a header, use the first column regardless of its name
-            urls = df.iloc[:, 0].tolist()
-        except:
-            # If that fails, try without header
-            file.file.seek(0)  # Reset file pointer
-            df = pd.read_csv(file.file, header=None)
-            urls = df.iloc[:, 0].tolist()
-            
-        # Clean and validate URLs
-        cleaned_urls = []
-        for url in urls:
-            url = str(url).strip()
-            if url and (url.startswith('http://') or url.startswith('https://')):
-                cleaned_urls.append(url)
-            else:
-                logger.warning(f"Skipping invalid URL: {url}")
+        # Use improved CSV processing
+        cleaned_urls = extract_youtube_urls_from_csv(file.file)
                 
         if not cleaned_urls:
-            raise HTTPException(status_code=400, detail="No valid URLs found in file")
+            raise HTTPException(status_code=400, detail="No valid YouTube URLs found in file. Please ensure your CSV contains YouTube channel or video URLs.")
             
-        logger.info(f"Found {len(cleaned_urls)} valid URLs to process")
+        logger.info(f"📋 Prepared {len(cleaned_urls)} URLs for bulk analysis")
             
         # Generate unique job ID
         job_id = str(uuid.uuid4())

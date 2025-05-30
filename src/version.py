@@ -2,12 +2,28 @@
 Version information for YouTube Content Compliance Analyzer
 """
 
-__version__ = "1.2.7"
-__version_info__ = (1, 2, 7)
-__build_date__ = "2025-05-29"
+__version__ = "1.2.8"
+__version_info__ = (1, 2, 8)
+__build_date__ = "2025-05-30"
 
 # Version history
 VERSION_HISTORY = {
+    "1.2.8": {
+        "date": "2025-05-30",
+        "changes": [
+            "MAJOR IMPROVEMENT: Centralized output directory configuration using get_output_directory() function",
+            "Added OUTPUT_DIR environment variable support (defaults to 'output') for configurable file storage",
+            "SEMANTIC CONSISTENCY: Updated all 'results' references to 'output' for consistent terminology",
+            "Enhanced CSV upload processing with intelligent YouTube URL column detection",
+            "Added automatic header detection for CSV files (handles files with or without headers)",
+            "Multi-column CSV support - automatically selects column with most YouTube URLs",
+            "Improved CSV error handling with detailed logging of detection process",
+            "Added is_youtube_url() function with comprehensive YouTube URL pattern matching",
+            "Fixed duplicate results_dir configuration by consolidating into single environment-driven function",
+            "Updated .gitignore and env.example to reflect new OUTPUT_DIR configuration",
+            "Improved user experience with better CSV upload error messages and guidance"
+        ]
+    },
     "1.2.7": {
         "date": "2025-05-29",
         "changes": [
