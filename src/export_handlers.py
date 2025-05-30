@@ -50,12 +50,22 @@ async def download_bulk_analysis_csv(job_id: str, analysis_results: dict):
         # Try to get scores from summary first (for completed jobs)
         summary = result.get('summary', {})
         if summary:
-            # Use existing summary data
+            # Use existing summary data for category scores
             for category, data in summary.items():
                 if category in all_categories:  # Only include valid categories
                     score = round(data.get('average_score', 0), 2)
                     row[category] = score
-                    row['overall_score'] = max(row['overall_score'], score)
+            
+            # Calculate CORRECT overall score - MAX from any individual video across ALL categories
+            # (NOT max of category averages!)
+            max_overall_score = 0.0
+            for video_analysis in result.get('video_analyses', []):
+                analysis = video_analysis.get('analysis', {})
+                for category, violation_data in analysis.get('results', {}).items():
+                    score = violation_data.get('score', 0)
+                    max_overall_score = max(max_overall_score, score)
+            
+            row['overall_score'] = round(max_overall_score, 2)
         else:
             # No summary available (likely cancelled job) - calculate from video analyses
             logger.info(f"📊 No summary found for {url}, calculating scores from video analyses")
@@ -65,6 +75,9 @@ async def download_bulk_analysis_csv(job_id: str, analysis_results: dict):
             for category in all_categories:
                 category_scores[category] = []
             
+            # Initialize overall score tracking
+            max_overall_score = 0.0
+            
             # Collect scores from all video analyses
             for video_analysis in result.get('video_analyses', []):
                 analysis = video_analysis.get('analysis', {})
@@ -73,18 +86,19 @@ async def download_bulk_analysis_csv(job_id: str, analysis_results: dict):
                         score = violation_data.get('score', 0)
                         if score > 0:
                             category_scores[category].append(score)
+                        # Track max score across ALL categories and videos
+                        max_overall_score = max(max_overall_score, score)
             
             # Calculate average scores for each category
             for category in all_categories:
                 if category_scores[category]:
                     avg_score = sum(category_scores[category]) / len(category_scores[category])
                     row[category] = round(avg_score, 2)
-                    row['overall_score'] = max(row['overall_score'], avg_score)
                 else:
                     row[category] = 0.0
             
-        # Round overall score
-        row['overall_score'] = round(row['overall_score'], 2)
+            # Use the true max score from any video
+            row['overall_score'] = round(max_overall_score, 2)
         
         # Determine status based on threshold
         if row['overall_score'] >= 0.6:

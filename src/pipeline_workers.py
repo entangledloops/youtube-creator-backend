@@ -947,33 +947,13 @@ async def monitor_pipeline_detailed(job_id: str, channel_queue: asyncio.Queue = 
                     llm_size = llm_queue.qsize() 
                     result_size = result_queue.qsize()
                     
-                    # FIXED PROGRESS CALCULATION: Use pipeline completion instead of URL processing
-                    # Progress should be based on how much of the total pipeline work is done
-                    # not just how many URLs have been "started"
-                    
-                    # Get pipeline stages to calculate true completion
-                    pipeline_stages = analysis_results[job_id].get('pipeline_stages', {})
-                    completed_work = pipeline_stages.get('completed', 0)
-                    failed_work = pipeline_stages.get('failed', 0)
-                    total_completed_work = completed_work + failed_work
-                    
-                    # Calculate expected total work (each URL generates multiple videos)
-                    # Use video_progress to get more accurate completion percentage
-                    video_progress = analysis_results[job_id].get('video_progress', {})
-                    total_videos_discovered = video_progress.get('total_videos_discovered', 0)
-                    videos_completed = video_progress.get('videos_completed', 0)
-                    
-                    # Use video-based progress if we have video discovery data, otherwise fall back to URL-based
-                    if total_videos_discovered > 0:
-                        progress_pct = (videos_completed / total_videos_discovered * 100)
-                        progress_display = f"{videos_completed}/{total_videos_discovered} videos"
-                    else:
-                        # Fallback to URL-based progress for early stages
-                        url_completed = len(analysis_results[job_id]['results'])
-                        url_failed = len(analysis_results[job_id]['failed_urls'])
-                        url_processed = url_completed + url_failed
-                        progress_pct = (url_processed / total_urls * 100) if total_urls > 0 else 0
-                        progress_display = f"{url_processed}/{total_urls} URLs"
+                    # REVERTED PROGRESS CALCULATION: Use URL-based completion
+                    # Calculate completion based on processed URLs
+                    url_completed = len(analysis_results[job_id]['results'])
+                    url_failed = len(analysis_results[job_id]['failed_urls'])
+                    url_processed = url_completed + url_failed
+                    progress_pct = (url_processed / total_urls * 100) if total_urls > 0 else 0
+                    progress_display = f"{url_processed}/{total_urls} URLs"
                     
                     logger.info(f"📊 D:{channel_size:2d} | C:{controversy_size:2d} | T:{video_size:2d} | L:{llm_size:2d} | R:{result_size:2d} | {progress_display} ({progress_pct:5.1f}%) | {elapsed:6.1f}s elapsed")
                     
@@ -1000,8 +980,8 @@ async def monitor_pipeline_detailed(job_id: str, channel_queue: asyncio.Queue = 
                         last_detailed_log = elapsed
                         
                         # Calculate processing rate based on total work completed
-                        if total_completed_work > 0:
-                            rate = total_completed_work / elapsed
+                        if url_processed > 0:
+                            rate = url_processed / elapsed
                             eta_info = calculate_job_eta(analysis_results[job_id])
                             
                             # Debug current max values
@@ -1018,21 +998,8 @@ async def monitor_pipeline_detailed(job_id: str, channel_queue: asyncio.Queue = 
                             logger.info(f"   └─ Pipeline stages: {analysis_results[job_id]['pipeline_stages']}")
                     
                     # If all work is done, break - IMPROVED COMPLETION CHECK
-                    # Use video completion if available, otherwise fall back to URL completion
                     work_complete = False
-                    if total_videos_discovered > 0:
-                        # Use video-based completion (more accurate)
-                        work_complete = (videos_completed >= total_videos_discovered and 
-                                       channel_size == 0 and controversy_size == 0 and 
-                                       video_size == 0 and llm_size == 0 and result_size == 0)
-                    else:
-                        # Fallback to URL-based completion 
-                        url_processed = len(analysis_results[job_id]['results']) + len(analysis_results[job_id]['failed_urls'])
-                        work_complete = (url_processed >= total_urls and 
-                                       channel_size == 0 and controversy_size == 0 and 
-                                       video_size == 0 and llm_size == 0 and result_size == 0)
-                    
-                    if work_complete:
+                    if url_processed >= total_urls and channel_size == 0 and controversy_size == 0 and video_size == 0 and llm_size == 0 and result_size == 0:
                         logger.info("🏁 All work completed, stopping monitor")
                         logger.info(f"📊 Final monitoring stats: {len(timing_stats['queue_depths']['channel'])} data points collected over {elapsed:.1f}s")
                         break
@@ -1047,10 +1014,10 @@ async def monitor_pipeline_detailed(job_id: str, channel_queue: asyncio.Queue = 
                             for i, timestamp in enumerate(timing_stats['timestamps'][-40:]):
                                 if timestamp <= current_time - 120:  # 2 minutes ago
                                     # Count completed work at that time
-                                    old_completed = total_completed_work
+                                    old_completed = url_processed
                                     break
                             
-                            if total_completed_work > old_completed:
+                            if url_processed > old_completed:
                                 recent_progress = True
                         
                         if not recent_progress and video_size > 0:

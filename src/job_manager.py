@@ -202,51 +202,16 @@ async def monitor_job_completion(job_id: str, urls: List[str], workers: List[asy
                 logger.info(f"🛑 Job {job_id} cancelled, stopping completion monitor")
                 break
             
-            # Check completion based on processed URLs
+            # Check completion based on processed URLs (REVERTED TO URL-BASED)
             total_processed = len(analysis_results[job_id]['results']) + len(analysis_results[job_id]['failed_urls'])
             all_urls_processed = total_processed >= len(urls)
             
-            # Check if all work is done - IMPROVED LOGIC
+            # Check if all work is done (SIMPLIFIED)
             all_queues_empty = all(q.empty() for q in queues.values())
             
-            # Get pipeline stages to check if any channels are still being processed
-            pipeline_stages = analysis_results[job_id].get('pipeline_stages', {})
-            channels_still_processing = (
-                pipeline_stages.get('queued_for_discovery', 0) +
-                pipeline_stages.get('discovering_videos', 0) +
-                pipeline_stages.get('queued_for_controversy', 0) +
-                pipeline_stages.get('screening_controversy', 0) +
-                pipeline_stages.get('queued_for_transcripts', 0) +
-                pipeline_stages.get('fetching_transcripts', 0) +
-                pipeline_stages.get('queued_for_llm', 0) +
-                pipeline_stages.get('llm_processing', 0) +
-                pipeline_stages.get('queued_for_results', 0) +
-                pipeline_stages.get('result_processing', 0)
-            )
-            
-            # IMPROVED COMPLETION LOGIC: Use video completion when available
-            # Check if we have video progress data for more accurate completion tracking
-            video_progress = analysis_results[job_id].get('video_progress', {})
-            total_videos_discovered = video_progress.get('total_videos_discovered', 0)
-            videos_completed = video_progress.get('videos_completed', 0)
-            
-            # Determine completion based on available data
-            if total_videos_discovered > 0:
-                # Use video-based completion (more accurate)
-                all_work_complete = videos_completed >= total_videos_discovered
-                completion_type = "video-based"
-                completion_info = f"{videos_completed}/{total_videos_discovered} videos completed"
-            else:
-                # Fallback to URL-based completion for early stages
-                all_work_complete = all_urls_processed
-                completion_type = "URL-based"
-                completion_info = f"{total_processed}/{len(urls)} URLs processed"
-            
-            # Job is complete when:
-            # 1. All work is complete (videos or URLs)
-            # 2. All queues are empty
-            # 3. No channels are still in processing stages
-            job_complete = all_work_complete and all_queues_empty and channels_still_processing == 0
+            # Job is complete when all URLs are processed AND all queues are empty
+            job_complete = all_urls_processed and all_queues_empty
+            completion_info = f"All {len(urls)} URLs processed"
             
             # DEBUG: Log detailed completion status when we're close to completion
             if all_queues_empty and not job_complete:
@@ -256,115 +221,70 @@ async def monitor_job_completion(job_id: str, urls: List[str], workers: List[asy
                 logger.warning(f"   └─ Failed URLs: {len(analysis_results[job_id]['failed_urls'])}")
                 logger.warning(f"   └─ Total processed: {total_processed}")
                 logger.warning(f"   └─ All URLs processed: {all_urls_processed}")
-                logger.warning(f"   └─ Completion type: {completion_type}")
-                logger.warning(f"   └─ Completion info: {completion_info}")
-                logger.warning(f"   └─ All work complete: {all_work_complete}")
-                logger.warning(f"   └─ Channels still processing: {channels_still_processing}")
-                logger.warning(f"   └─ Pipeline stages: {pipeline_stages}")
                 
-                # If all work is complete but we still have channels in processing stages,
-                # this indicates a pipeline tracking issue
-                if all_work_complete and channels_still_processing > 0:
-                    logger.warning(f"   └─ PIPELINE TRACKING ISSUE: All work complete but {channels_still_processing} channels still in processing stages")
-                    logger.warning(f"   └─ This may indicate a race condition or tracking bug")
-                    # Continue without sleeping - the pipeline stages should resolve themselves
-                    continue
-                
-                # Check for missing URLs only if we don't have all URLs processed
+                # Check for missing URLs and add them to failed_urls
                 if not all_urls_processed:
-                    # Since we waited for url_task, all URLs are definitely in the pipeline
-                    # But we should still check if channels are processing to avoid false positives
-                    if channels_still_processing > 0:
-                        # Channels are still being processed, so "missing" URLs might just be in transit
-                        continue
-                    
-                    # If we still have missing URLs at this point with no channels processing, it's a real issue
                     processed_urls = set(analysis_results[job_id]['results'].keys()) | set(f['url'] for f in analysis_results[job_id]['failed_urls'])
                     missing_urls = set(urls) - processed_urls
                     if missing_urls:
                         logger.warning(f"   └─ Missing URLs: {missing_urls}")
-                        logger.info(f"🔍 MISSING_URLS DEBUG: Current failed_urls: {[f['url'] for f in analysis_results[job_id]['failed_urls']]}")
-                        logger.info(f"🔍 MISSING_URLS DEBUG: Current results: {list(analysis_results[job_id]['results'].keys())}")
                         
-                        # Check if missing URLs have controversy check failures
-                        controversy_failures = analysis_results[job_id].get('controversy_check_failures', {})
+                        # Add missing URLs to failed_urls to complete the job
                         for missing_url in missing_urls:
-                            # CRITICAL FIX: Check if URL is already in failed_urls to avoid duplicates
+                            # Check if URL is already in failed_urls to avoid duplicates
                             already_in_failed = any(f['url'] == missing_url for f in analysis_results[job_id]['failed_urls'])
                             if already_in_failed:
                                 logger.info(f"📋 URL {missing_url} already in failed_urls - skipping duplicate addition")
                                 continue
                             
+                            # Check if this URL has controversy check failure info
+                            controversy_failures = analysis_results[job_id].get('controversy_check_failures', {})
                             if missing_url in controversy_failures:
                                 controversy_info = controversy_failures[missing_url]
-                                logger.warning(f"   └─ Missing URL {missing_url} has controversy check failure: {controversy_info}")
-                                
-                                # Determine the appropriate error message and type based on controversy status
                                 controversy_status = controversy_info.get('status', 'unknown')
                                 controversy_reason = controversy_info.get('reason', 'Unknown reason')
                                 channel_name = controversy_info.get('channel_name', 'Unknown')
                                 
                                 if controversy_status == 'controversial':
-                                    # Controversial channels should already be in results, not failed_urls
-                                    # Check if it's already in results
-                                    if missing_url in analysis_results[job_id]['results']:
-                                        logger.info(f"📋 Controversial channel {missing_url} already in results - no action needed")
-                                        continue
-                                    else:
-                                        # This shouldn't happen with the new logic, but handle it just in case
-                                        logger.warning(f"📋 Controversial channel {missing_url} missing from results - this is unexpected")
-                                        error_msg = f"Channel flagged for controversy: {controversy_reason}"
-                                        error_type = 'controversy_flagged'
+                                    # Controversial channels should be in results, not failed_urls
+                                    logger.warning(f"📋 Controversial channel {missing_url} missing from results - this shouldn't happen")
+                                    error_msg = f"Channel flagged for controversy: {controversy_reason}"
+                                    error_type = 'controversy_flagged_missing'
                                 elif controversy_status == 'not_controversial':
-                                    # Channel passed controversy but had no successful videos
-                                    error_msg = f"Channel processing completed but no videos were successfully analyzed. All video transcripts may have failed."
+                                    error_msg = f"Channel processing completed but no videos were successfully analyzed."
                                     error_type = 'no_videos_completed'
-                                    logger.info(f"📋 Channel {missing_url} completed but no videos succeeded")
                                 else:
-                                    # Controversy screening had an error
-                                    error_msg = f"Controversy screening failed: {controversy_reason}. Channel processing was incomplete."
+                                    error_msg = f"Controversy screening failed: {controversy_reason}"
                                     error_type = 'controversy_screening_error'
-                                    logger.info(f"📋 Channel {missing_url} had controversy screening error")
                                 
-                                # Only add to failed_urls if not controversial (controversial ones are in results now)
-                                if controversy_status != 'controversial':
-                                    analysis_results[job_id]['failed_urls'].append({
-                                        'url': missing_url,
-                                        'error': error_msg,
-                                        'error_type': error_type,
-                                        'channel_name': channel_name,
-                                        'controversy_status': controversy_status,
-                                        'controversy_reason': controversy_reason
-                                    })
-                                    logger.info(f"✅ Added missing URL {missing_url} to failed_urls for proper completion tracking")
-                                    logger.info(f"🔍 MISSING_URLS DEBUG: Added {missing_url} to failed_urls ({error_type}) - total failed: {len(analysis_results[job_id]['failed_urls'])}")
+                                analysis_results[job_id]['failed_urls'].append({
+                                    'url': missing_url,
+                                    'error': error_msg,
+                                    'error_type': error_type,
+                                    'channel_name': channel_name,
+                                    'controversy_status': controversy_status,
+                                    'controversy_reason': controversy_reason
+                                })
                             else:
-                                logger.warning(f"   └─ Missing URL {missing_url} has no controversy check failure")
-                                
-                                # CRITICAL FIX: Check if URL is already in failed_urls to avoid duplicates
-                                already_in_failed = any(f['url'] == missing_url for f in analysis_results[job_id]['failed_urls'])
-                                if already_in_failed:
-                                    logger.info(f"📋 URL {missing_url} already in failed_urls - skipping duplicate addition")
-                                    continue
-                                
-                                # This shouldn't happen, but if it does, add it as a generic failure
+                                # No controversy info - generic pipeline failure
                                 analysis_results[job_id]['failed_urls'].append({
                                     'url': missing_url,
                                     'error': f"Channel was not properly tracked through the processing pipeline.",
                                     'error_type': 'pipeline_tracking_error',
                                     'channel_name': 'Unknown'
                                 })
-                                logger.info(f"✅ Added untracked URL {missing_url} to failed_urls")
-                                logger.info(f"🔍 MISSING_URLS DEBUG: Added {missing_url} to failed_urls (pipeline_tracking_error) - total failed: {len(analysis_results[job_id]['failed_urls'])}")
+                            
+                            logger.info(f"✅ Added missing URL {missing_url} to failed_urls to complete job")
                         
                         # Update total processed count after adding missing URLs
                         total_processed = len(analysis_results[job_id]['results']) + len(analysis_results[job_id]['failed_urls'])
                         all_urls_processed = total_processed >= len(urls)
+                        job_complete = all_urls_processed and all_queues_empty
                         logger.info(f"📊 Updated completion status: {total_processed}/{len(urls)} URLs processed")
             
             # Check for job completion with improved logic
             if job_complete:
-                logger.info(f"✅ Job {job_id} completed - {completion_info} and no channels still processing")
+                logger.info(f"✅ Job {job_id} completed - {completion_info}")
                 
                 # Mark job as completed
                 analysis_results[job_id]['status'] = 'completed'
@@ -593,6 +513,17 @@ async def create_channel_summaries(job_id: str, analysis_results: dict):
             
             # Update the channel data with summary
             analysis_results[job_id]['results'][url]['summary'] = summary
+            
+            # Calculate overall score - MAX score from any individual video across ALL categories
+            channel_max_score = 0.0
+            for video_analysis in video_analyses:
+                analysis = video_analysis.get("analysis", {})
+                for category, violation_data in analysis.get("results", {}).items():
+                    score = violation_data.get("score", 0)
+                    channel_max_score = max(channel_max_score, score)
+            
+            # Add overall score to the channel data
+            analysis_results[job_id]['results'][url]['overall_score'] = round(channel_max_score, 2)
         
         # Remove failed channels from results
         for url in channels_to_remove:
