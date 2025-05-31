@@ -8,7 +8,7 @@ import aiohttp
 import requests
 import pandas as pd
 import logging
-from typing import Dict, Any
+from typing import Dict, Any, List
 import asyncio
 
 logging.basicConfig(level=logging.INFO)
@@ -32,20 +32,49 @@ class LLMAnalyzer:
         self.openai_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
         self.context_size = int(os.getenv("LLM_CONTEXT_SIZE", "128000"))
         
-        # Calculate max input tokens (reserve 1000 tokens for response)
-        self.max_input_tokens = max(1000, self.context_size - 1000)
+        # Define how many tokens to reserve for the LLM's response
+        self.response_token_reservation = int(os.getenv("LLM_RESPONSE_TOKEN_RESERVATION", "3000"))
         
-        logger.info(f"LLM Configuration - Model: {self.openai_model}, Context Size: {self.context_size}, Max Input: {self.max_input_tokens}")
+        # Calculate max input tokens for the prompt (total context - reserved for response)
+        # Ensure there's at least a minimum viable number of tokens for input (e.g., 1000)
+        self.max_input_tokens = max(1000, self.context_size - self.response_token_reservation)
+        
+        logger.info(f"LLM Configuration - Model: {self.openai_model}, Context Size: {self.context_size}, Max Input Tokens (for prompt): {self.max_input_tokens}, Reserved Output Tokens (for response): {self.response_token_reservation}")
         
         # Handle default categories file path
-        if categories_file is None:
-            # Get the project root directory (parent of src)
+        resolved_categories_file_path = categories_file
+        if resolved_categories_file_path is None:
             src_dir = os.path.dirname(__file__)
             project_root = os.path.dirname(src_dir)
-            categories_file = os.path.join(project_root, "data", "YouTube_Controversy_Categories.csv")
-        
-        self.categories_df = pd.read_csv(categories_file)
-        
+            resolved_categories_file_path = os.path.join(project_root, "data", "YouTube_Controversy_Categories.csv")
+            logger.info(f"LLMAnalyzer: No categories_file provided, defaulting to: {resolved_categories_file_path}")
+        else:
+            logger.info(f"LLMAnalyzer: Using provided categories_file: {resolved_categories_file_path}")
+
+        try:
+            self.categories_df = pd.read_csv(resolved_categories_file_path)
+            if 'Category' not in self.categories_df.columns:
+                logger.error(f"LLMAnalyzer: 'Category' column not found in {resolved_categories_file_path}. Category list will be empty.")
+                # Create an empty DataFrame with 'Category' column to prevent errors in get_category_names
+                self.categories_df = pd.DataFrame({'Category': pd.Series(dtype='str')})
+            elif self.categories_df['Category'].isnull().all():
+                logger.warning(f"LLMAnalyzer: 'Category' column in {resolved_categories_file_path} is present but all values are null/empty. Category list will be empty.")
+                self.categories_df = pd.DataFrame({'Category': pd.Series(dtype='str')})
+            else:
+                # Drop rows where 'Category' is NaN, if any, and convert to string
+                self.categories_df.dropna(subset=['Category'], inplace=True)
+                self.categories_df['Category'] = self.categories_df['Category'].astype(str)
+                logger.info(f"LLMAnalyzer: Successfully loaded {len(self.categories_df)} categories from {resolved_categories_file_path}. First few: {self.categories_df['Category'].head().tolist()}")
+        except FileNotFoundError:
+            logger.error(f"LLMAnalyzer: Categories CSV file not found at {resolved_categories_file_path}. Category list will be empty.")
+            self.categories_df = pd.DataFrame({'Category': pd.Series(dtype='str')}) # Empty DataFrame with 'Category' column
+        except pd.errors.EmptyDataError:
+            logger.error(f"LLMAnalyzer: Categories CSV file at {resolved_categories_file_path} is empty. Category list will be empty.")
+            self.categories_df = pd.DataFrame({'Category': pd.Series(dtype='str')})
+        except Exception as e:
+            logger.error(f"LLMAnalyzer: Error loading categories CSV from {resolved_categories_file_path}: {e}. Category list will be empty.")
+            self.categories_df = pd.DataFrame({'Category': pd.Series(dtype='str')})
+
         if provider == "local":
             self.api_base_url = os.getenv("LOCAL_LLM_URL", "http://localhost:1234/v1")
         elif provider == "openai":
@@ -58,6 +87,12 @@ class LLMAnalyzer:
         else:
             raise ValueError(f"Unsupported LLM provider: {provider}")
             
+    def get_category_names(self) -> List[str]:
+        """Returns the list of category names loaded from the CSV."""
+        if self.categories_df is not None and 'Category' in self.categories_df.columns:
+            return self.categories_df['Category'].tolist()
+        return [] # Return empty list if not loaded properly
+
     def _prepare_categories_prompt(self):
         """Format controversy categories for prompt"""
         categories_text = ""
@@ -152,48 +187,71 @@ All categories must be included in the JSON response. If no violations exist, sc
     
     def _extract_valid_json(self, text):
         """Extract and parse valid JSON from text, handling common formatting errors"""
+        # Strip common non-JSON prefixes/suffixes like backticks and language specifiers
+        original_text = text # Keep original for logging if all fails
+        text = re.sub(r"^```json\s*", "", text.strip()) # Remove ```json prefix
+        text = re.sub(r"\s*```$", "", text) # Remove ``` suffix
+        text = text.strip() # General strip
+
         try:
             # First attempt: Try to parse the whole text as JSON
             return json.loads(text)
         except json.JSONDecodeError:
-            # Find what looks like JSON
+            # Second attempt: Find what looks like the main JSON object using regex
             try:
-                json_match = re.search(r'({[\s\S]*})', text)
+                json_match = re.search(r'^\s*({[\s\S]*})\s*$', text) # Match if text IS a JSON object
                 if json_match:
                     json_str = json_match.group(1)
                     return json.loads(json_str)
-            except:
+            except json.JSONDecodeError: # Changed from generic except
+                pass # Continue to next fallback
+            except Exception as e: # Catch other regex/string errors
+                logger.debug(f"_extract_valid_json: Regex search or inner parse failed: {e}")
                 pass
+
+            # Third attempt: Fallback for incomplete JSON (if it's just missing the final '}')
+            if text.startswith('{') and not text.endswith('}'):
+                try:
+                    logger.warning("_extract_valid_json: Attempting to fix potentially incomplete JSON by adding closing brace.")
+                    return json.loads(text + '}')
+                except json.JSONDecodeError:
+                    pass # If adding '}' doesn't work, proceed to manual extraction
             
-            # Attempt to extract categories manually
+            # Fourth attempt: Manual category extraction (as a last resort for very broken JSON)
             try:
-                # Find all category entries
+                logger.warning("_extract_valid_json: Falling back to manual category extraction.")
                 categories = {}
-                
-                # Match patterns like: "Category Name": { ... }
-                pattern = r'"([^"]+)":\s*{([^{}]|{[^{}]*})*}'
-                matches = re.findall(pattern, text)
+                pattern = r'"([^"]+)":\s*{([^{}]|{[^{}]*})*}' # This pattern tries to find "Category Name": { ... }
+                matches = re.findall(pattern, original_text) # Use original_text for this fragile regex
                 
                 for match in matches:
                     category_name = match[0]
-                    category_content = "{" + match[1] + "}"
-                    
-                    # Try to parse the category content
+                    # The content captured by ([^{}]|{[^{}]*})* might be tricky.
+                    # It's better to parse each identified segment carefully.
                     try:
-                        category_data = json.loads(category_content)
-                        if 'score' in category_data and category_data['score'] > 0:
-                            categories[category_name] = category_data
-                    except:
-                        pass
+                        # Reconstruct the potential JSON for the category item
+                        # This is still risky if the content itself is malformed.
+                        # Minimal assumption: structure is "CategoryName": { ... valid json ... }
+                        # We need to find the full extent of the object for this category_name
+                        # This regex is not perfect for that. A full parser would be better if this is common.
+                        # For now, let's assume the regex found a reasonable segment for the category.
+                        category_data_str = "{" + match[1] + "}"
+                        category_data = json.loads(category_data_str)
+                        categories[category_name] = category_data
+                    except json.JSONDecodeError as e_cat:
+                        logger.warning(f"_extract_valid_json: Manual extraction failed for category '{category_name}' content '{match[1]}': {e_cat}")
+                        pass # Skip this category if its content is malformed
                 
-                if categories:
+                if categories: # If we successfully extracted at least one category this way
+                    logger.warning(f"_extract_valid_json: Manually extracted {len(categories)} categories.")
                     return categories
-            except:
+            except Exception as e_manual:
+                logger.error(f"_extract_valid_json: Error during manual category extraction: {e_manual}")
                 pass
                 
-            # Last resort: manual extraction
-            logger.error(f"Failed to parse LLM response, returning empty result")
-            return {}
+        # All attempts failed
+        logger.error(f"Failed to parse LLM response. Cleaned text for parsing: '{text}'. Raw text: '{original_text}', returning empty result")
+        return {}
     
     def analyze_transcript(self, transcript_text: str, video_title: str, video_id: str) -> Dict[str, Any]:
         """
@@ -270,11 +328,23 @@ All categories must be included in the JSON response. If no violations exist, sc
                 # Extract valid JSON
                 analysis_results = self._extract_valid_json(content)
                 
-                # Filter out categories with low scores - only serious violations (>0.2)
+                # CRITICAL FIX: Add debugging to track what the LLM actually returned
+                logger.info(f"🤖 LLM returned {len(analysis_results)} categories for video {video_id}")
+                for category, data in analysis_results.items():
+                    score = data.get('score', 0)
+                    logger.debug(f"   📊 '{category}': score {score}")
+                
+                # Filter out categories with low scores - only serious violations (>MIN_VIOLATION_SCORE)
+                original_count = len(analysis_results)
                 analysis_results = {
                     category: data for category, data in analysis_results.items()
                     if data.get('score', 0) > self.MIN_VIOLATION_SCORE
                 }
+                filtered_count = len(analysis_results)
+                
+                logger.info(f"🔍 Filtered results: {original_count} -> {filtered_count} categories (threshold: {self.MIN_VIOLATION_SCORE})")
+                if filtered_count < original_count:
+                    logger.debug(f"   🗑️ Filtered out {original_count - filtered_count} categories with scores <= {self.MIN_VIOLATION_SCORE}")
                 
                 return {
                     "video_id": video_id,
@@ -324,7 +394,7 @@ All categories must be included in the JSON response. If no violations exist, sc
                 {"role": "user", "content": prompt}
             ],
             "temperature": 0.1,
-            "max_tokens": 1000  # Limit response size
+            "max_tokens": self.response_token_reservation
         }
         
         # Log the request payload (excluding the full prompt for brevity)
@@ -349,11 +419,23 @@ All categories must be included in the JSON response. If no violations exist, sc
                 # Extract valid JSON
                 analysis_results = self._extract_valid_json(content)
                 
-                # Filter out categories with low scores - only serious violations (>0.2)
+                # CRITICAL FIX: Add debugging to track what the LLM actually returned
+                logger.info(f"🤖 OpenAI returned {len(analysis_results)} categories for video {video_id}")
+                for category, data in analysis_results.items():
+                    score = data.get('score', 0)
+                    logger.debug(f"   📊 '{category}': score {score}")
+                
+                # Filter out categories with low scores - only serious violations (>MIN_VIOLATION_SCORE)
+                original_count = len(analysis_results)
                 analysis_results = {
                     category: data for category, data in analysis_results.items()
                     if data.get('score', 0) > self.MIN_VIOLATION_SCORE
                 }
+                filtered_count = len(analysis_results)
+                
+                logger.info(f"🔍 Filtered OpenAI results: {original_count} -> {filtered_count} categories (threshold: {self.MIN_VIOLATION_SCORE})")
+                if filtered_count < original_count:
+                    logger.debug(f"   🗑️ Filtered out {original_count - filtered_count} categories with scores <= {self.MIN_VIOLATION_SCORE}")
                 
                 return {
                     "video_id": video_id,
@@ -382,7 +464,7 @@ All categories must be included in the JSON response. If no violations exist, sc
                 {"role": "user", "content": prompt}
             ],
             "temperature": 0.1,
-            "max_tokens": 1000  # Limit response size
+            "max_tokens": self.response_token_reservation
         }
         
         max_retries = 3
@@ -415,11 +497,23 @@ All categories must be included in the JSON response. If no violations exist, sc
                             # Extract valid JSON
                             analysis_results = self._extract_valid_json(content)
                             
-                            # Filter out categories with low scores - only serious violations (>0.2)
+                            # CRITICAL FIX: Add debugging to track what the LLM actually returned
+                            logger.info(f"🤖 OpenAI returned {len(analysis_results)} categories for video {video_id}")
+                            for category, data in analysis_results.items():
+                                score = data.get('score', 0)
+                                logger.debug(f"   📊 '{category}': score {score}")
+                            
+                            # Filter out categories with low scores - only serious violations (>MIN_VIOLATION_SCORE)
+                            original_count = len(analysis_results)
                             analysis_results = {
                                 category: data for category, data in analysis_results.items()
                                 if data.get('score', 0) > self.MIN_VIOLATION_SCORE
                             }
+                            filtered_count = len(analysis_results)
+                            
+                            logger.info(f"🔍 Filtered OpenAI results: {original_count} -> {filtered_count} categories (threshold: {self.MIN_VIOLATION_SCORE})")
+                            if filtered_count < original_count:
+                                logger.debug(f"   🗑️ Filtered out {original_count - filtered_count} categories with scores <= {self.MIN_VIOLATION_SCORE}")
                             
                             return {
                                 "video_id": video_id,
@@ -470,39 +564,73 @@ All categories must be included in the JSON response. If no violations exist, sc
             
             # Create summary across all videos
             summary = {}
-            for category in self.categories_df['Category'].tolist():
-                category_violations = []
-                max_score = 0
-                total_score = 0
-                videos_with_violations = 0
-                
-                for video_analysis in results["video_analyses"]:
-                    if category in video_analysis["analysis"].get("results", {}):
-                        violation = video_analysis["analysis"]["results"][category]
-                        score = violation.get("score", 0)
+            predefined_categories = self.categories_df['Category'].tolist()
+
+            for video_analysis in results["video_analyses"]:
+                analysis_results_data = video_analysis.get("analysis", {}).get("results", {})
+                for llm_category_name, llm_category_data in analysis_results_data.items():
+                    # Find the matching predefined_category using fuzzy matching
+                    matched_category_name = None
+                    normalized_llm_category_name = llm_category_name.lower().replace('"', '').replace("'", "").strip()
+
+                    for predefined_cat_name in predefined_categories:
+                        normalized_predefined_cat_name = predefined_cat_name.lower().replace('"', '').replace("'", "").strip()
+                        if normalized_llm_category_name == normalized_predefined_cat_name:
+                            matched_category_name = predefined_cat_name
+                            break
+                    
+                    if not matched_category_name:
+                        # If no exact or fuzzy match, we might decide to log or skip
+                        # For now, let's use the LLM's category name if no match,
+                        # or one could choose to only include matched categories.
+                        # This behavior should align with CreatorProcessor and export_handlers.
+                        # For consistency with CreatorProcessor which uses LLM's categories as keys:
+                        matched_category_name = llm_category_name 
+                        if llm_category_name not in predefined_categories:
+                             logger.warning(f"LLMAnalyzer summary: LLM category '{llm_category_name}' not in predefined list. Adding it to summary anyway.")
+
+
+                    if matched_category_name not in summary:
+                        summary[matched_category_name] = {
+                            "max_score": 0.0,
+                            "total_score": 0.0, # Will be used for average calculation
+                            "videos_with_violations": 0,
+                            "total_videos_for_category": 0, # Videos where this category was found
+                            "examples": []
+                        }
+                    
+                    summary[matched_category_name]["total_videos_for_category"] += 1
+                    score = llm_category_data.get("score", 0)
+
+                    if score > self.MIN_VIOLATION_SCORE: # Use MIN_VIOLATION_SCORE
+                        summary[matched_category_name]["videos_with_violations"] += 1
+                        summary[matched_category_name]["max_score"] = max(summary[matched_category_name]["max_score"], score)
+                        summary[matched_category_name]["total_score"] += score
                         
-                        if score > 0:
-                            videos_with_violations += 1
-                            max_score = max(max_score, score)
-                            total_score += score
-                            
-                            category_violations.append({
-                                "video_id": video_analysis["video_id"],
-                                "video_title": video_analysis["video_title"],
-                                "video_url": video_analysis["video_url"],
-                                "score": score,
-                                "evidence": violation.get("evidence", [])[0] if violation.get("evidence") else ""
-                            })
+                        summary[matched_category_name]["examples"].append({
+                            "video_id": video_analysis["video_id"],
+                            "video_title": video_analysis["video_title"],
+                            "video_url": video_analysis["video_url"],
+                            "score": score,
+                            "evidence": llm_category_data.get("evidence", [])[0] if llm_category_data.get("evidence") else ""
+                        })
+
+            # Calculate averages and sort examples, and set overall total_videos
+            total_analyzed_videos = len(results["video_analyses"])
+            for category_name, cat_data in summary.items():
+                if cat_data["videos_with_violations"] > 0:
+                    cat_data["average_score"] = round(cat_data["total_score"] / cat_data["videos_with_violations"], 2)
+                else:
+                    cat_data["average_score"] = 0.0
                 
-                if videos_with_violations > 0:
-                    summary[category] = {
-                        "max_score": max_score,
-                        "average_score": total_score / videos_with_violations,
-                        "videos_with_violations": videos_with_violations,
-                        "total_videos": len(results["video_analyses"]),
-                        "examples": sorted(category_violations, key=lambda x: x["score"], reverse=True)[:5]
-                    }
-            
+                cat_data["examples"] = sorted(
+                    cat_data["examples"],
+                    key=lambda x: x.get("score", 0),
+                    reverse=True
+                )[:5]
+                del cat_data["total_score"] # Remove temporary field
+                cat_data["total_videos_in_channel"] = total_analyzed_videos # Add total videos analyzed in channel
+
             results["summary"] = summary
             return results
             
@@ -577,39 +705,73 @@ All categories must be included in the JSON response. If no violations exist, sc
             
             # Create summary across all videos
             summary = {}
-            for category in self.categories_df['Category'].tolist():
-                category_violations = []
-                max_score = 0
-                total_score = 0
-                videos_with_violations = 0
-                
-                for video_analysis in results["video_analyses"]:
-                    if category in video_analysis["analysis"].get("results", {}):
-                        violation = video_analysis["analysis"]["results"][category]
-                        score = violation.get("score", 0)
+            predefined_categories = self.categories_df['Category'].tolist()
+
+            for video_analysis in results["video_analyses"]:
+                analysis_results_data = video_analysis.get("analysis", {}).get("results", {})
+                for llm_category_name, llm_category_data in analysis_results_data.items():
+                    # Find the matching predefined_category using fuzzy matching
+                    matched_category_name = None
+                    normalized_llm_category_name = llm_category_name.lower().replace('"', '').replace("'", "").strip()
+
+                    for predefined_cat_name in predefined_categories:
+                        normalized_predefined_cat_name = predefined_cat_name.lower().replace('"', '').replace("'", "").strip()
+                        if normalized_llm_category_name == normalized_predefined_cat_name:
+                            matched_category_name = predefined_cat_name
+                            break
+                    
+                    if not matched_category_name:
+                        # If no exact or fuzzy match, we might decide to log or skip
+                        # For now, let's use the LLM's category name if no match,
+                        # or one could choose to only include matched categories.
+                        # This behavior should align with CreatorProcessor and export_handlers.
+                        # For consistency with CreatorProcessor which uses LLM's categories as keys:
+                        matched_category_name = llm_category_name 
+                        if llm_category_name not in predefined_categories:
+                             logger.warning(f"LLMAnalyzer summary: LLM category '{llm_category_name}' not in predefined list. Adding it to summary anyway.")
+
+
+                    if matched_category_name not in summary:
+                        summary[matched_category_name] = {
+                            "max_score": 0.0,
+                            "total_score": 0.0, # Will be used for average calculation
+                            "videos_with_violations": 0,
+                            "total_videos_for_category": 0, # Videos where this category was found
+                            "examples": []
+                        }
+                    
+                    summary[matched_category_name]["total_videos_for_category"] += 1
+                    score = llm_category_data.get("score", 0)
+
+                    if score > self.MIN_VIOLATION_SCORE: # Use MIN_VIOLATION_SCORE
+                        summary[matched_category_name]["videos_with_violations"] += 1
+                        summary[matched_category_name]["max_score"] = max(summary[matched_category_name]["max_score"], score)
+                        summary[matched_category_name]["total_score"] += score
                         
-                        if score > 0:
-                            videos_with_violations += 1
-                            max_score = max(max_score, score)
-                            total_score += score
-                            
-                            category_violations.append({
-                                "video_id": video_analysis["video_id"],
-                                "video_title": video_analysis["video_title"],
-                                "video_url": video_analysis["video_url"],
-                                "score": score,
-                                "evidence": violation.get("evidence", [])[0] if violation.get("evidence") else ""
-                            })
+                        summary[matched_category_name]["examples"].append({
+                            "video_id": video_analysis["video_id"],
+                            "video_title": video_analysis["video_title"],
+                            "video_url": video_analysis["video_url"],
+                            "score": score,
+                            "evidence": llm_category_data.get("evidence", [])[0] if llm_category_data.get("evidence") else ""
+                        })
+
+            # Calculate averages and sort examples, and set overall total_videos
+            total_analyzed_videos = len(results["video_analyses"])
+            for category_name, cat_data in summary.items():
+                if cat_data["videos_with_violations"] > 0:
+                    cat_data["average_score"] = round(cat_data["total_score"] / cat_data["videos_with_violations"], 2)
+                else:
+                    cat_data["average_score"] = 0.0
                 
-                if videos_with_violations > 0:
-                    summary[category] = {
-                        "max_score": max_score,
-                        "average_score": total_score / videos_with_violations,
-                        "videos_with_violations": videos_with_violations,
-                        "total_videos": len(results["video_analyses"]),
-                        "examples": sorted(category_violations, key=lambda x: x["score"], reverse=True)[:5]
-                    }
-            
+                cat_data["examples"] = sorted(
+                    cat_data["examples"],
+                    key=lambda x: x.get("score", 0),
+                    reverse=True
+                )[:5]
+                del cat_data["total_score"] # Remove temporary field
+                cat_data["total_videos_in_channel"] = total_analyzed_videos # Add total videos analyzed in channel
+
             results["summary"] = summary
             return results
             

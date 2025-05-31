@@ -2,12 +2,54 @@
 Version information for YouTube Content Compliance Analyzer
 """
 
-__version__ = "1.2.8"
-__version_info__ = (1, 2, 8)
+__version__ = "1.2.10"
+__version_info__ = (1, 2, 10)
 __build_date__ = "2025-05-30"
 
 # Version history
 VERSION_HISTORY = {
+    "1.2.10": {
+        "date": "2025-05-30",
+        "changes": [
+            "CRITICAL BUG FIX: Fixed category name mismatch causing video scores to be ignored in final results",
+            "Added fuzzy category matching to handle LLM returning 'Adult content' vs expected '\"Adult\" content'",
+            "Fixed issue where 0.5 scores for adult content were processed but not included in CSV exports",
+            "Enhanced debugging to identify exact vs fuzzy category matches in summary creation",
+            "Added comprehensive category mismatch detection and logging for better troubleshooting",
+            "Applied fuzzy matching to both summary creation and CSV export fallback logic for consistency",
+            "Fixed misleading comments that still referenced old >0.2 filtering threshold",
+            "Video analysis results with valid scores (e.g., 0.5) are no longer ignored due to category name differences",
+            "Improved category name normalization to handle quotes, apostrophes, and case differences",
+            "Enhanced logging to show expected vs found categories and potential matches for debugging"
+        ]
+    },
+    "1.2.9": {
+        "date": "2025-05-30",
+        "changes": [
+            "CRITICAL BUG FIX: Fixed cache hits being treated as new LLM requests causing 429 errors",
+            "Cache hits now properly use their cached LLM analysis results instead of triggering new OpenAI calls",
+            "Fixed disconnect where videos had valid cached scores but overall creator score was 0.0",
+            "Enhanced cache hit fallback logic to include transcript field and proper video analysis structure",
+            "Added comprehensive debugging to track cache hit processing and identify when cached results are used",
+            "Fixed root cause where cache hits showed valid scores in frontend but were ignored in aggregation",
+            "CRITICAL BUG INVESTIGATION: Added comprehensive debugging for scores being ignored in final results",
+            "Added structure debugging to trace exact video analysis data format and identify malformed responses",
+            "Enhanced aggregation debugging to track every step of score calculation and category matching",
+            "Added per-video category breakdown to identify which videos have valid scores that get lost",
+            "Implemented detailed category aggregation logging showing exact match vs fuzzy match attempts", 
+            "Added final summary debugging to show what categories made it through aggregation",
+            "Enhanced overall score calculation debugging to track all score sources and identify where max score comes from",
+            "Added error detection for videos that return error responses instead of valid analysis",
+            "Improved logging to distinguish between videos with no categories vs videos with zero scores",
+            "Added per-category aggregation traces to identify where valid scores are being dropped",
+            "Fixed misleading comments that referenced old >0.2 filtering threshold (now using MIN_VIOLATION_SCORE=0.0)",
+            "Added fuzzy category matching to handle LLM returning slightly different category names",
+            "Applied consistent fuzzy matching to both summary creation and CSV export logic",
+            "CRITICAL FIX: Fixed variable name collision in create_channel_summaries where 'analysis_results' parameter was being overwritten",
+            "This fix prevents the summary creation from crashing and allows all channels to be processed correctly",
+            "Added traceback logging to exception handler for better error debugging"
+        ]
+    },
     "1.2.8": {
         "date": "2025-05-30",
         "changes": [

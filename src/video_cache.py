@@ -118,8 +118,10 @@ class VideoCache:
         Returns:
             Dict with 'transcript' and 'llm_result' keys if found, None otherwise
         """
+        logger.info(f"📦 GET_CACHED_RESULT called for {video_url}. Cache disabled status: {self.cache_disabled}")
         # Return None immediately if cache is disabled
         if self.cache_disabled:
+            logger.info("📦 Cache is disabled, get_cached_result returning None immediately.")
             return None
             
         try:
@@ -184,8 +186,10 @@ class VideoCache:
         Returns:
             Dict with 'transcript' key if found, None otherwise
         """
+        logger.info(f"📦 GET_CACHED_TRANSCRIPT called for {video_url}. Cache disabled status: {self.cache_disabled}")
         # Return None immediately if cache is disabled
         if self.cache_disabled:
+            logger.info("📦 Cache is disabled, get_cached_transcript returning None immediately.")
             return None
             
         try:
@@ -248,16 +252,23 @@ class VideoCache:
         Returns:
             True if stored successfully, False otherwise
         """
-        # Return True immediately if cache is disabled (no-op)
+        logger.info(f"📦 STORE_RESULT called for {video_url}. Cache disabled status: {self.cache_disabled}, Transcript-only status: {self.cache_transcripts_only}")
+        # Do not store if cache is disabled
         if self.cache_disabled:
-            return True
-            
+            logger.info("📦 Cache is disabled, store_result returning False immediately.")
+            return False
+
+        llm_result_to_store = llm_result
+        if self.cache_transcripts_only:
+            logger.info("📦 Cache is in transcript-only mode, LLM results will be stored as empty in this call to store_result.")
+            llm_result_to_store = {} # Store empty dict for llm_result if transcript-only mode
+
         try:
             url_hash = self._get_url_hash(video_url)
             
             # Convert to JSON
             transcript_json = json.dumps(transcript)
-            llm_result_json = json.dumps(llm_result)
+            llm_result_json = json.dumps(llm_result_to_store)
             
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
@@ -278,6 +289,52 @@ class VideoCache:
                 
         except Exception as e:
             logger.error(f"Error storing result in cache for {video_url}: {str(e)}")
+            return False
+    
+    def store_transcript_only(self, video_url: str, video_id: str, video_title: str,
+                              channel_id: str, channel_name: str, transcript: Dict[str, Any]) -> bool:
+        """
+        Store only the transcript in the cache. Used when CACHE_TRANSCRIPTS_ONLY is true.
+        
+        Returns:
+            True if stored successfully, False otherwise
+        """
+        logger.info(f"📦 STORE_TRANSCRIPT_ONLY called for {video_url}. Cache disabled status: {self.cache_disabled}")
+        if self.cache_disabled:
+            logger.info("📦 Cache is disabled, store_transcript_only returning False.")
+            return False
+
+        # This function is specifically for transcript-only mode or when only transcript is available.
+        # If CACHE_TRANSCRIPTS_ONLY is false, it will still only store the transcript and an empty LLM result.
+        
+        try:
+            url_hash = self._get_url_hash(video_url)
+            
+            # Convert to JSON
+            transcript_json = json.dumps(transcript)
+            # Always store an empty JSON object for llm_result_json to maintain table structure
+            # if this specific function is called.
+            llm_result_json = json.dumps({})
+            
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                
+                # Insert or replace entry
+                cursor.execute('''
+                    INSERT OR REPLACE INTO video_cache 
+                    (video_url, video_id, video_title, channel_id, channel_name, 
+                     transcript_json, llm_result_json, url_hash)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (video_url, video_id, video_title, channel_id, channel_name,
+                      transcript_json, llm_result_json, url_hash))
+                
+                conn.commit()
+                
+                logger.debug(f"💾 Cached transcript for video {video_id}: {video_title}")
+                return True
+                
+        except Exception as e:
+            logger.error(f"Error storing transcript in cache for {video_url}: {str(e)}")
             return False
     
     def get_cache_stats(self) -> Dict[str, Any]:

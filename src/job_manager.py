@@ -413,6 +413,8 @@ async def create_channel_summaries(job_id: str, analysis_results: dict):
         
         # First, check for controversy failures that didn't make it to results
         controversy_failures = analysis_results[job_id].get('controversy_check_failures', {})
+        job_status = analysis_results[job_id].get('status', 'unknown')
+        
         for url, controversy_info in controversy_failures.items():
             # Check if this URL made it to results
             if url not in analysis_results[job_id]['results']:
@@ -425,10 +427,18 @@ async def create_channel_summaries(job_id: str, analysis_results: dict):
                     # Check if it's already in failed_urls to avoid duplicates
                     already_failed = any(f['url'] == url for f in analysis_results[job_id]['failed_urls'])
                     if not already_failed:
+                        # FIXED: Use context-appropriate error message
+                        if job_status == 'cancelled':
+                            error_msg = "Channel was not processed before the job was cancelled"
+                            error_type = 'cancelled_before_processing'
+                        else:
+                            error_msg = f"Channel processing failed: {controversy_info.get('reason', 'Unknown reason')}"
+                            error_type = 'processing_failed'
+                        
                         analysis_results[job_id]['failed_urls'].append({
                             'url': url,
-                            'error': f"Channel processing failed: {controversy_info.get('reason', 'Unknown reason')}",
-                            'error_type': 'processing_failed',
+                            'error': error_msg,
+                            'error_type': error_type,
                             'channel_name': controversy_info.get('channel_name', 'Unknown'),
                             'controversy_reason': controversy_info.get('reason', 'Unknown reason')
                         })
@@ -478,21 +488,141 @@ async def create_channel_summaries(job_id: str, analysis_results: dict):
                 
             # Create summary across all videos for this channel
             summary = {}
+            
+            # CRITICAL FIX: Add debugging to track analysis processing
+            logger.info(f"🔍 SUMMARY DEBUG: Processing {len(video_analyses)} video analyses for channel {url}")
+            
+            # DEBUG: Track what categories we're expecting vs what we're getting
+            expected_categories = set(all_categories)
+            found_categories = set()
+            
+            # CRITICAL DEBUG: Check the actual structure of video analyses
+            logger.error(f"🚨 STRUCTURE DEBUG for {url}:")
+            for i, video_analysis in enumerate(video_analyses):
+                logger.error(f"   Video {i+1} structure keys: {list(video_analysis.keys())}")
+                
+                # Check if 'analysis' key exists and what it contains
+                if 'analysis' in video_analysis:
+                    analysis_obj = video_analysis['analysis']
+                    logger.error(f"   Video {i+1} analysis keys: {list(analysis_obj.keys()) if isinstance(analysis_obj, dict) else 'NOT A DICT'}")
+                    
+                    # Check if 'results' exists in analysis
+                    if isinstance(analysis_obj, dict) and 'results' in analysis_obj:
+                        results_obj = analysis_obj['results']
+                        logger.error(f"   Video {i+1} results type: {type(results_obj)}, length: {len(results_obj) if isinstance(results_obj, dict) else 'N/A'}")
+                        
+                        # Show actual categories and scores
+                        if isinstance(results_obj, dict):
+                            for cat, data in results_obj.items():
+                                score = data.get('score', 0) if isinstance(data, dict) else 'INVALID'
+                                logger.error(f"      Category '{cat}': score = {score}")
+                    else:
+                        logger.error(f"   Video {i+1} has no valid 'results' in analysis!")
+                else:
+                    logger.error(f"   Video {i+1} has no 'analysis' key!")
+            
+            # Continue with existing debug code but track all videos
+            all_video_categories = {}  # Track categories per video
+            for i, video_analysis in enumerate(video_analyses):
+                analysis_data = video_analysis.get("analysis", {})
+                
+                # Check for error responses
+                if 'error' in analysis_data:
+                    logger.error(f"   📹 Video {i+1} has ERROR: {analysis_data.get('error')}")
+                    continue
+                
+                results_data = analysis_data.get("results", {})
+                all_video_categories[i] = list(results_data.keys()) if results_data else []
+                logger.debug(f"   📹 Video {i+1} ({video_analysis.get('video_id', 'unknown')}): {len(results_data)} categories analyzed")
+                
+                # Track what categories the LLM actually returned
+                for cat_name, cat_data in results_data.items():
+                    found_categories.add(cat_name)
+                    score = cat_data.get("score", 0)
+                    if score > 0:
+                        logger.debug(f"      ✅ Category '{cat_name}': score {score}")
+                    else:
+                        logger.debug(f"      ❌ Category '{cat_name}': score {score} (filtered out)")
+            
+            # Show per-video category breakdown
+            logger.error(f"🎥 PER-VIDEO CATEGORY BREAKDOWN:")
+            for vid_idx, cats in all_video_categories.items():
+                logger.error(f"   Video {vid_idx + 1}: {len(cats)} categories - {cats[:3]}{'...' if len(cats) > 3 else ''}")
+            
+            # CRITICAL DEBUG: Compare expected vs found categories
+            logger.warning(f"🔍 CATEGORY MISMATCH DEBUG for {url}:")
+            logger.warning(f"   Expected categories: {sorted(expected_categories)}")
+            logger.warning(f"   Found categories: {sorted(found_categories)}")
+            
+            # Check for exact mismatches
+            missing_from_results = expected_categories - found_categories
+            extra_in_results = found_categories - expected_categories
+            
+            if missing_from_results:
+                logger.warning(f"   ❌ Missing from LLM results: {sorted(missing_from_results)}")
+            if extra_in_results:
+                logger.warning(f"   ⚠️  Extra in LLM results: {sorted(extra_in_results)}")
+                
+            # Show potential matches for misnamed categories
+            for extra_cat in extra_in_results:
+                for missing_cat in missing_from_results:
+                    if extra_cat.lower().replace('"', '').replace("'", "") == missing_cat.lower().replace('"', '').replace("'", ""):
+                        logger.error(f"   🚨 POTENTIAL MATCH: '{extra_cat}' (LLM) might be '{missing_cat}' (expected)")
+            
             for category in all_categories:
                 category_violations = []
                 max_score = 0
                 total_score = 0
                 videos_with_violations = 0
                 
+                # DEBUG: Track what happens for each category
+                category_debug = []
+                
                 for video_analysis in video_analyses:
-                    if category in video_analysis.get("analysis", {}).get("results", {}):
-                        violation = video_analysis["analysis"]["results"][category]
+                    # CRITICAL FIX: Try exact match first, then fuzzy match
+                    violation = None
+                    video_results = video_analysis.get("analysis", {}).get("results", {})  # FIXED: renamed from analysis_results to avoid collision
+                    
+                    # DEBUG: Log what we're looking at
+                    video_id = video_analysis.get('video_id', 'unknown')
+                    category_debug.append(f"Video {video_id}: checking for '{category}'")
+                    
+                    if category in video_results:
+                        # Exact match found
+                        violation = video_results[category]
+                        logger.debug(f"✅ Exact match for '{category}' in video {video_analysis.get('video_id', 'unknown')}")
+                        category_debug.append(f"  ✅ Found exact match with score {violation.get('score', 0)}")
+                    else:
+                        # Try fuzzy matching - normalize both category names
+                        normalized_expected = category.lower().replace('"', '').replace("'", "").strip()
+                        
+                        for llm_category, llm_data in video_results.items():
+                            normalized_llm = llm_category.lower().replace('"', '').replace("'", "").strip()
+                            if normalized_expected == normalized_llm:
+                                violation = llm_data
+                                logger.warning(f"🔧 FUZZY MATCH: LLM returned '{llm_category}', expected '{category}' - using LLM result")
+                                category_debug.append(f"  🔧 Found fuzzy match '{llm_category}' with score {violation.get('score', 0)}")
+                                break
+                        
+                        if not violation:
+                            category_debug.append(f"  ❌ No match found (checked {len(video_results)} categories)")
+                            # DEBUG: Show what we tried to match
+                            if '"adult"' in normalized_expected or 'adult' in normalized_expected:
+                                logger.error(f"     🔍 DEBUG: Expected normalized: '{normalized_expected}'")
+                                for llm_cat in video_results.keys():
+                                    norm_llm = llm_cat.lower().replace('"', '').replace("'", "").strip()
+                                    logger.error(f"     🔍 DEBUG: LLM cat '{llm_cat}' → normalized '{norm_llm}'")
+                    
+                    if violation:
                         score = violation.get("score", 0)
                         
+                        # CRITICAL FIX: Add debugging for score processing
                         if score > 0:
                             videos_with_violations += 1
                             max_score = max(max_score, score)
                             total_score += score
+                            logger.debug(f"✅ Found violation for '{category}': score {score} in video {video_analysis.get('video_id', 'unknown')}")
+                            category_debug.append(f"  📊 Added to violations: score {score}")
                             
                             category_violations.append({
                                 "video_id": video_analysis["video_id"],
@@ -501,8 +631,22 @@ async def create_channel_summaries(job_id: str, analysis_results: dict):
                                 "score": score,
                                 "evidence": violation.get("evidence", [])[0] if violation.get("evidence") else ""
                             })
+                        else:
+                            logger.debug(f"❌ Skipping '{category}' with score {score} in video {video_analysis.get('video_id', 'unknown')}")
+                            category_debug.append(f"  ⚠️ Score was 0, skipping")
+                    else:
+                        logger.debug(f"❌ Category '{category}' not found in video {video_analysis.get('video_id', 'unknown')} analysis")
+                
+                # DEBUG: Show what happened for this category
+                if videos_with_violations > 0 or len(category_debug) > 10:  # Show if violations found or many videos
+                    logger.error(f"📊 CATEGORY '{category}' AGGREGATION:")
+                    logger.error(f"   Found {videos_with_violations} violations, max score: {max_score}")
+                    if len(category_debug) <= 20:  # Don't spam logs for huge channels
+                        for debug_line in category_debug:
+                            logger.error(f"   {debug_line}")
                 
                 if videos_with_violations > 0:
+                    logger.info(f"📊 Category '{category}': {videos_with_violations} violations, max score: {max_score}")
                     summary[category] = {
                         "max_score": max_score,
                         "average_score": total_score / videos_with_violations,
@@ -510,17 +654,43 @@ async def create_channel_summaries(job_id: str, analysis_results: dict):
                         "total_videos": len(video_analyses),
                         "examples": sorted(category_violations, key=lambda x: x["score"], reverse=True)[:5]
                     }
+                else:
+                    logger.debug(f"📊 Category '{category}': No violations found")
+            
+            logger.info(f"📊 SUMMARY RESULT: {len(summary)} categories with violations for channel {url}")
+            
+            # DEBUG: Show the actual summary content
+            logger.error(f"📋 FINAL SUMMARY for {url}:")
+            for cat, data in summary.items():
+                logger.error(f"   '{cat}': max_score={data.get('max_score', 0)}, avg={data.get('average_score', 0):.2f}, violations={data.get('videos_with_violations', 0)}/{data.get('total_videos', 0)}")
             
             # Update the channel data with summary
             analysis_results[job_id]['results'][url]['summary'] = summary
             
             # Calculate overall score - MAX score from any individual video across ALL categories
             channel_max_score = 0.0
+            score_sources = []  # Track where max scores come from
+            
             for video_analysis in video_analyses:
                 analysis = video_analysis.get("analysis", {})
+                video_id = video_analysis.get("video_id", "unknown")
+                
+                # Check for errors
+                if "error" in analysis:
+                    logger.error(f"   ⚠️ Video {video_id} has error: {analysis.get('error')}")
+                    continue
+                
                 for category, violation_data in analysis.get("results", {}).items():
                     score = violation_data.get("score", 0)
+                    if score > 0:
+                        score_sources.append(f"{video_id}: {category}={score}")
                     channel_max_score = max(channel_max_score, score)
+            
+            # DEBUG: Show overall score calculation
+            logger.error(f"📊 OVERALL SCORE CALCULATION for {url}:")
+            logger.error(f"   Max score found: {channel_max_score}")
+            logger.error(f"   Score sources (top 5): {score_sources[:5]}")
+            logger.error(f"   Total score sources: {len(score_sources)}")
             
             # Add overall score to the channel data
             analysis_results[job_id]['results'][url]['overall_score'] = round(channel_max_score, 2)
@@ -538,6 +708,7 @@ async def create_channel_summaries(job_id: str, analysis_results: dict):
         
     except Exception as e:
         logger.error(f"💥 Error creating channel summaries: {str(e)}")
+        logger.error(traceback.format_exc())
 
 async def process_job_with_cleanup(job_id: str, urls: List[str], video_limit: int, llm_provider: str, analysis_results: dict):
     """Process a job without blocking - just start the pipeline"""

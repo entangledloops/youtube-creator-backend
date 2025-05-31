@@ -22,7 +22,7 @@ class YouTubeAnalyzer:
         self.youtube_api_key = youtube_api_key
         
         # More aggressive rate limiting to prevent IP blocking
-        self.max_concurrent_requests = int(os.getenv("YOUTUBE_MAX_CONCURRENT", "2"))  # Reduced from 5 to 2
+        self.max_concurrent_requests = int(os.getenv("YOUTUBE_MAX_CONCURRENT", "5"))  # Increased from 2 to 5
         self.request_delay_seconds = float(os.getenv("YOUTUBE_REQUEST_DELAY", "3.0"))  # Increased from 2.0 to 3.0 seconds
         
         self.semaphore = asyncio.Semaphore(self.max_concurrent_requests)

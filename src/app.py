@@ -7,13 +7,68 @@ Environment Variables for YouTube Rate Limiting (to prevent IP blocking):
 """
 import os
 from dotenv import load_dotenv
+
+# Load environment variables FIRST
+# This ensures that all modules have access to .env configurations upon import
+env_path_for_load = os.path.join(os.path.dirname(os.path.dirname(__file__)), '.env')
+# Force reload of environment variables
+if os.path.exists(env_path_for_load):
+    print(f"Found .env file at: {env_path_for_load}, loading variables...") # Using print for very early feedback
+    load_dotenv(env_path_for_load, override=True)
+    
+    # Verify the API key was loaded (Example, can be expanded)
+    # openai_api_key_loaded = os.getenv("OPENAI_API_KEY")
+    # if not openai_api_key_loaded or openai_api_key_loaded == "your_openai_api_key_here":
+    #     print("ERROR: Invalid or missing OpenAI API key in .env file") # Using print
+    # else:
+    #     print(f"Loaded OpenAI API key: {openai_api_key_loaded[:4]}...{openai_api_key_loaded[-4:] if len(openai_api_key_loaded) > 8 else openai_api_key_loaded}") # Using print
+else:
+    print(f"WARNING: No .env file found at {env_path_for_load}. Proceeding with system environment variables if any.") # Using print
+
+import logging # Configure logging AFTER .env is loaded (in case logging config comes from .env)
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__) # Get logger after basicConfig
+
+# Now that .env is loaded and logging is configured, we can use the logger
+logger.info("Environment variables loaded and logging configured.")
+if os.path.exists(env_path_for_load):
+    # Log OpenAI API Key status
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key or api_key == "your_openai_api_key_here":
+        logger.error("Invalid or missing OpenAI API key in .env file")
+        logger.error("Please ensure your .env file contains a valid OPENAI_API_KEY")
+        # Consider if you want to raise ValueError here or let app try to run without it
+    else:
+        api_key_preview = f"{api_key[:4]}...{api_key[-4:]}" if len(api_key) > 8 else api_key
+        logger.info(f"Loaded OpenAI API key: {api_key_preview}")
+
+    # Log YouTube API Key status
+    youtube_api_key_env = os.getenv("YOUTUBE_API_KEY")
+    if not youtube_api_key_env or youtube_api_key_env == "your_youtube_api_key_here":
+        logger.warning("Invalid or missing YouTube API key in .env file. Scraping will be used if applicable.")
+    else:
+        yt_api_key_preview = f"{youtube_api_key_env[:4]}...{youtube_api_key_env[-4:]}" if len(youtube_api_key_env) > 8 else youtube_api_key_env
+        logger.info(f"Loaded YouTube API key: {yt_api_key_preview}")
+else:
+    logger.warning(f"No .env file was found at {env_path_for_load}. Key checks skipped.")
+
+
+# Set specific loggers to reduce verbosity (can be done here or later)
+logging.getLogger("src.youtube_analyzer").setLevel(logging.WARNING)
+logging.getLogger("src.llm_analyzer").setLevel(logging.WARNING)
+
+
 from fastapi import FastAPI, HTTPException, Query, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from sse_starlette.sse import EventSourceResponse
 from pydantic import BaseModel, HttpUrl
 from typing import Optional, List, Dict, Any
-import logging
 import asyncio
 import pandas as pd
 import uuid
@@ -38,47 +93,43 @@ from src.export_handlers import (
     download_failed_urls_csv
 )
 from src.pipeline_workers import calculate_job_eta
-from src.video_cache import video_cache
+from src.video_cache import video_cache # Now this will initialize AFTER .env is loaded
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
-logger = logging.getLogger(__name__)
+# Global logger from earlier is fine.
+# logger.info("Loading environment variables...") # This was moved up
+# env_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), '.env') # This was moved up
+# logger.info(f"Looking for .env file at: {env_path}") # This was moved up
 
-# Set specific loggers to reduce verbosity
-logging.getLogger("src.youtube_analyzer").setLevel(logging.WARNING)
-logging.getLogger("src.llm_analyzer").setLevel(logging.WARNING)
-
-# Load environment variables
-logger.info("Loading environment variables...")
-env_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), '.env')
-logger.info(f"Looking for .env file at: {env_path}")
-
-# Force reload of environment variables
-if os.path.exists(env_path):
-    logger.info("Found .env file, loading variables...")
-    # Force reload of environment variables
-    load_dotenv(env_path, override=True)
+# Force reload of environment variables # The main block for this was moved up
+# if os.path.exists(env_path):
+#    logger.info("Found .env file, loading variables...")
+#    load_dotenv(env_path, override=True) # This was moved up
     
-    # Verify the API key was loaded
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key or api_key == "your_openai_api_key_here":
-        logger.error("Invalid or missing OpenAI API key in .env file")
-        logger.error("Please ensure your .env file contains a valid OPENAI_API_KEY")
-        raise ValueError("Invalid or missing OpenAI API key in .env file")
+    # Verify the API key was loaded # This was moved up
+    # api_key = os.getenv("OPENAI_API_KEY")
+    # if not api_key or api_key == "your_openai_api_key_here":
+    #     logger.error("Invalid or missing OpenAI API key in .env file")
+    #     logger.error("Please ensure your .env file contains a valid OPENAI_API_KEY")
+    #     raise ValueError("Invalid or missing OpenAI API key in .env file")
     
-    # Log the API key that was loaded (first 4 and last 4 chars for security)
-    api_key_preview = f"{api_key[:4]}...{api_key[-4:]}" if len(api_key) > 8 else api_key
-    logger.info(f"Loaded OpenAI API key: {api_key_preview}")
-else:
-    logger.error(f"No .env file found at {env_path}")
-    logger.error("Please create a .env file with your OpenAI API key")
-    raise ValueError("No .env file found")
+    # Log the API key that was loaded (first 4 and last 4 chars for security) # This was moved up
+    # api_key_preview = f"{api_key[:4]}...{api_key[-4:]}" if len(api_key) > 8 else api_key
+    # logger.info(f"Loaded OpenAI API key: {api_key_preview}")
+
+    # Verify and log YouTube API Key # This was moved up
+    # youtube_api_key_env = os.getenv("YOUTUBE_API_KEY")
+    # if not youtube_api_key_env or youtube_api_key_env == "your_youtube_api_key_here":
+    #     logger.warning("Invalid or missing YouTube API key in .env file. Scraping will be used.")
+    # else:
+    #     yt_api_key_preview = f"{youtube_api_key_env[:4]}...{youtube_api_key_env[-4:]}" if len(youtube_api_key_env) > 8 else youtube_api_key_env
+    #     logger.info(f"Loaded YouTube API key: {yt_api_key_preview}")
+# else: # This was moved up
+#    logger.error(f"No .env file found at {env_path}")
+#    logger.error("Please create a .env file with your OpenAI API key")
+#    raise ValueError("No .env file found")
 
 # Get default LLM provider from environment
-default_llm_provider = os.getenv("LLM_PROVIDER", "local")
+default_llm_provider = os.getenv("LLM_PROVIDER", "local") # This is fine here, after .env load
 logger.info(f"Default LLM provider from environment: {default_llm_provider}")
 
 # Initialize FastAPI app
@@ -689,8 +740,19 @@ async def get_bulk_analysis_status(job_id: str):
         cache_hits = video_progress.get('cache_hits', 0)
         video_progress_percentage = (videos_completed / total_videos * 100) if total_videos > 0 else 0
         
-        # Calculate ETA using shared function
-        eta_info = calculate_job_eta(job)
+        # Determine YouTube API calls for this specific job
+        yt_api_calls_for_this_job = 0
+        if job_id == job_manager.current_job_id:
+            # For the currently processing job, get live counter
+            yt_api_calls_for_this_job = youtube_rate_limiter['total_api_calls']
+        elif 'performance_stats' in job and 'youtube_api_calls_for_job' in job['performance_stats']:
+            # For completed/cancelled jobs, get the stored counter
+            yt_api_calls_for_this_job = job['performance_stats']['youtube_api_calls_for_job']
+
+        # Calculate ETA if job is processing
+        eta_info = {}
+        if job['status'] == 'processing':
+            eta_info = calculate_job_eta(job)
         
         # Get controversy check failures
         controversy_failures = job.get('controversy_check_failures', {})
@@ -705,27 +767,42 @@ async def get_bulk_analysis_status(job_id: str):
             pipeline_stages['controversy_check_failed'] = controversy_failed_count
         
         # Get real-time queue sizes from active job tasks
+        # Initialize with correct keys expected by frontend/status consumers
         queue_sizes = {
-            'channel_queue_size': 0,
-            'controversy_queue_size': 0,
-            'video_queue_size': 0,
-            'transcript_queue_size': 0,
-            'analysis_queue_size': 0
+            'channel_queue': 0,
+            'controversy_queue': 0,
+            'video_queue': 0, # Represents items waiting for transcript
+            'llm_queue': 0    # Represents items waiting for LLM analysis
         }
         
+        job_process_task = None
         if job_id in active_job_tasks:
-            for task in active_job_tasks[job_id]:
-                if hasattr(task, 'get_queues'):
-                    queues = task.get_queues()
-                    if queues:
-                        queue_sizes.update({
-                            'channel_queue_size': queues.get('channel_queue', asyncio.Queue()).qsize(),
-                            'controversy_queue_size': queues.get('controversy_queue', asyncio.Queue()).qsize(),
-                            'video_queue_size': queues.get('video_queue', asyncio.Queue()).qsize(),
-                            'transcript_queue_size': queues.get('transcript_queue', asyncio.Queue()).qsize(),
-                            'analysis_queue_size': queues.get('llm_queue', asyncio.Queue()).qsize()
-                        })
+            # Find the main process_job_with_cleanup task
+            for task_ref in active_job_tasks[job_id]:
+                # Check if the task is an instance of the coroutine we're looking for
+                # This check is a bit indirect; ideally, tasks would be tagged or stored more specifically.
+                # For now, we check for a unique method it's supposed to have.
+                if hasattr(task_ref, 'get_queues') and asyncio.iscoroutinefunction(task_ref.get_coro):
+                     # A more robust check might be needed if task_ref.get_coro().__name__ can be reliably checked
+                     # For now, presence of get_queues is the primary indicator for process_job_with_cleanup task wrapper
+                    job_process_task = task_ref
+                    break
         
+        if job_process_task and hasattr(job_process_task, 'get_queues'):
+            try:
+                queues_from_task = job_process_task.get_queues() # Call method on the task object
+                if queues_from_task:
+                    queue_sizes['channel_queue'] = queues_from_task.get('channel_queue', asyncio.Queue()).qsize()
+                    queue_sizes['controversy_queue'] = queues_from_task.get('controversy_queue', asyncio.Queue()).qsize()
+                    queue_sizes['video_queue'] = queues_from_task.get('video_queue', asyncio.Queue()).qsize()
+                    queue_sizes['llm_queue'] = queues_from_task.get('llm_queue', asyncio.Queue()).qsize()
+                else:
+                    logger.debug(f"get_queues() for job {job_id} returned None or empty dict.")
+            except Exception as e_queue:
+                logger.error(f"Error calling get_queues() or accessing qsize for job {job_id}: {e_queue}")
+        else:
+            logger.debug(f"No active task with get_queues() method found for job {job_id} to fetch live queue sizes.")
+
         # Build detailed response
         response = {
             "job_id": job_id,
@@ -767,7 +844,10 @@ async def get_bulk_analysis_status(job_id: str):
                 }
             },
             
-            # YouTube rate limiting stats
+            # YouTube API calls specifically for the job being queried
+            "job_specific_youtube_api_calls": yt_api_calls_for_this_job,
+            
+            # Global/Live YouTube rate limiting stats (reflects current active job or 0 if none)
             "youtube_stats": {
                 "total_transcript_requests": youtube_rate_limiter['total_transcript_requests'],
                 "total_api_calls": youtube_rate_limiter['total_api_calls'],
@@ -781,7 +861,12 @@ async def get_bulk_analysis_status(job_id: str):
             "eta": eta_info,
             
             # Queue information with real-time sizes
-            "queue_info": queue_sizes
+            "queue_info": queue_sizes,
+            'failed_urls_count': len(job.get('failed_urls', [])),
+            'total_urls': job.get('total_urls', 0),
+            'processed_urls': job['processed_urls'],
+            'job_queue_position': job.get('queue_position', 0),
+            'active_workers': len(active_job_tasks.get(job_id, []))
         }
         
         # Add queue position info for queued jobs
@@ -935,8 +1020,44 @@ async def cancel_bulk_analysis(job_id: str):
             analysis_results[job_id]['status'] = 'cancelled'
             analysis_results[job_id]['completed_at'] = datetime.now().isoformat()
             
-            logger.info(f"✅ Cancelled queued job {job_id}")
+            # CRITICAL FIX: Calculate proper overall scores for cancelled jobs
+            # This ensures partial results show correct creator scores in the UI
+            try:
+                from src.job_manager import create_channel_summaries
+                await create_channel_summaries(job_id, analysis_results)
+                logger.info(f"✅ Generated channel summaries for cancelled job {job_id}")
+            except Exception as e:
+                logger.error(f"⚠️ Failed to generate summaries for cancelled job {job_id}: {str(e)}")
             
+            # Reset current job and start next in queue
+            job_manager.current_job_id = None
+            
+            # Start next job if any are queued
+            if job_queue:
+                next_job = job_queue.pop(0)
+                job_manager.current_job_id = next_job['job_id']
+                
+                # Update status and start processing
+                analysis_results[job_manager.current_job_id]['status'] = 'processing'
+                analysis_results[job_manager.current_job_id]['queue_position'] = 0
+                
+                logger.info(f"🚀 Starting next queued job {job_manager.current_job_id}")
+                
+                task = asyncio.create_task(
+                    process_job_with_cleanup(
+                        job_manager.current_job_id,
+                        next_job['urls'],
+                        next_job['video_limit'],
+                        next_job['llm_provider'],
+                        analysis_results
+                    )
+                )
+                
+                # Track task for cancellation
+                active_job_tasks[job_manager.current_job_id] = [task]
+            
+            logger.info(f"✅ Cancelled queued job {job_id}")
+        
         elif job['status'] == 'processing' and job_manager.current_job_id == job_id:
             # Cancel active job
             analysis_results[job_id]['status'] = 'cancelling'
@@ -993,6 +1114,15 @@ async def cancel_bulk_analysis(job_id: str):
             # Mark as cancelled and preserve partial results
             analysis_results[job_id]['status'] = 'cancelled'
             analysis_results[job_id]['completed_at'] = datetime.now().isoformat()
+            
+            # CRITICAL FIX: Calculate proper overall scores for cancelled jobs
+            # This ensures partial results show correct creator scores in the UI
+            try:
+                from src.job_manager import create_channel_summaries
+                await create_channel_summaries(job_id, analysis_results)
+                logger.info(f"✅ Generated channel summaries for cancelled job {job_id}")
+            except Exception as e:
+                logger.error(f"⚠️ Failed to generate summaries for cancelled job {job_id}: {str(e)}")
             
             # Reset current job and start next in queue
             job_manager.current_job_id = None
@@ -1100,6 +1230,14 @@ async def cancel_all_jobs():
                     # Mark as cancelled
                     analysis_results[job_manager.current_job_id]['status'] = 'cancelled'
                     analysis_results[job_manager.current_job_id]['completed_at'] = datetime.now().isoformat()
+                    
+                    # CRITICAL FIX: Calculate proper overall scores for cancelled jobs
+                    try:
+                        from src.job_manager import create_channel_summaries
+                        await create_channel_summaries(job_manager.current_job_id, analysis_results)
+                        logger.info(f"✅ Generated channel summaries for cancelled job {job_manager.current_job_id}")
+                    except Exception as e:
+                        logger.error(f"⚠️ Failed to generate summaries for cancelled job {job_manager.current_job_id}: {str(e)}")
                     
                     # Cancel all active tasks for this job
                     if job_manager.current_job_id in active_job_tasks:
